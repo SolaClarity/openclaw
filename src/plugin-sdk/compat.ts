@@ -77,34 +77,83 @@ export {
   mapAllowFromEntries,
 } from "./channel-config-helpers.js";
 export { formatAllowFromLowercase, formatNormalizedAllowFromEntries } from "./allow-from.js";
-export * from "./channel-config-schema.js";
+// Freeze the shipped compat config-schema surface so new focused primitives do
+// not silently become deprecated root exports.
+export {
+  AllowFromListSchema,
+  BlockStreamingCoalesceSchema,
+  buildCatchallMultiAccountChannelSchema,
+  buildChannelConfigSchema,
+  buildGroupEntrySchema,
+  buildJsonChannelConfigSchema,
+  buildMultiAccountChannelSchema,
+  buildNestedDmConfigSchema,
+  ChannelGroupEntrySchema,
+  ContextVisibilityModeSchema,
+  DmConfigSchema,
+  DmPolicySchema,
+  GroupPolicySchema,
+  MarkdownConfigSchema,
+  MentionPatternsPolicySchema,
+  ReplyRuntimeConfigSchemaShape,
+  requireAllowlistAllowFrom,
+  requireOpenAllowFrom,
+  ToolPolicySchema,
+} from "./channel-config-schema.js";
 export * from "./channel-policy.js";
 export { collectOpenGroupPolicyConfiguredRouteWarnings } from "./channel-policy.js";
 export * from "./reply-history.js";
-export * from "./directory-runtime.js";
+// Freeze the shipped compat surface so focused directory-runtime additions do
+// not silently become new deprecated root exports.
+export {
+  applyDirectoryQueryAndLimit,
+  type ChannelDirectoryEntry,
+  type ChannelDirectoryEntryKind,
+  collectNormalizedDirectoryIds,
+  createChannelDirectoryAdapter,
+  createEmptyChannelDirectoryAdapter,
+  createInspectedDirectoryEntriesLister,
+  createResolvedDirectoryEntriesLister,
+  createRuntimeDirectoryLiveAdapter,
+  type DirectoryConfigParams,
+  emptyChannelDirectoryList,
+  inspectReadOnlyChannelAccount,
+  listDirectoryEntriesFromSources,
+  listDirectoryGroupEntriesFromMapKeys,
+  listDirectoryGroupEntriesFromMapKeysAndAllowFrom,
+  listDirectoryUserEntriesFromAllowFrom,
+  listDirectoryUserEntriesFromAllowFromAndMapKeys,
+  listInspectedDirectoryEntriesFromSources,
+  listResolvedDirectoryEntriesFromSources,
+  listResolvedDirectoryGroupEntriesFromMapKeys,
+  listResolvedDirectoryUserEntriesFromAllowFrom,
+  nullChannelDirectorySelf,
+  type ReadOnlyInspectedAccount,
+  toDirectoryEntries,
+} from "./directory-runtime.js";
 export { mapAllowlistResolutionInputs } from "./allow-from.js";
 
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export const createChannelReplyPipeline = createChannelReplyPipelineCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export const createReplyPrefixContext = createReplyPrefixContextCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export const createReplyPrefixOptions = createReplyPrefixOptionsCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export const createTypingCallbacks = createTypingCallbacksCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export const resolveChannelSourceReplyDeliveryMode = resolveChannelSourceReplyDeliveryModeCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export type ChannelReplyPipeline = ChannelReplyPipelineCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export type CreateTypingCallbacksParams = CreateTypingCallbacksParamsCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export type ReplyPrefixContext = ReplyPrefixContextCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export type ReplyPrefixContextBundle = ReplyPrefixContextBundleCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export type ReplyPrefixOptions = ReplyPrefixOptionsCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export type SourceReplyDeliveryMode = SourceReplyDeliveryModeCompat;
-/** @deprecated Use `openclaw/plugin-sdk/channel-message`. */
+/** @deprecated Use `openclaw/plugin-sdk/channel-outbound`. */
 export type TypingCallbacks = TypingCallbacksCompat;

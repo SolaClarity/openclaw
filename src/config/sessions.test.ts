@@ -1,8 +1,10 @@
+// Covers session config persistence and compatibility behavior.
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../test-utils/deferred.js";
 import { withEnv } from "../test-utils/env.js";
 import {
   buildGroupDisplayName,
@@ -13,7 +15,6 @@ import {
   resolveSessionKey,
   resolveSessionTranscriptPath,
   resolveSessionTranscriptsDir,
-  updateLastRoute,
   updateSessionStore,
   updateSessionStoreEntry,
 } from "./sessions.js";
@@ -57,14 +58,6 @@ describe("sessions", () => {
       "sessions",
       "sess-1.jsonl",
     );
-  }
-
-  function buildMainSessionEntry(overrides: Record<string, unknown> = {}) {
-    return {
-      sessionId: "sess-1",
-      updatedAt: 123,
-      ...overrides,
-    };
   }
 
   async function createAgentSessionsLayout(label: string): Promise<{
@@ -225,224 +218,6 @@ describe("sessions", () => {
     });
   }
 
-  it("updateLastRoute persists channel and target", async () => {
-    const mainSessionKey = "agent:main:main";
-    const { storePath } = await createSessionStoreFixture({
-      prefix: "updateLastRoute",
-      entries: {
-        [mainSessionKey]: buildMainSessionEntry({
-          systemSent: true,
-          thinkingLevel: "low",
-          responseUsage: "on",
-          queueDebounceMs: 1234,
-          reasoningLevel: "on",
-          elevatedLevel: "on",
-          authProfileOverride: "auth-1",
-          compactionCount: 2,
-        }),
-      },
-    });
-
-    await updateLastRoute({
-      storePath,
-      sessionKey: mainSessionKey,
-      deliveryContext: {
-        channel: "telegram",
-        to: "  12345  ",
-      },
-    });
-
-    const store = loadSessionStore(storePath);
-    expect(store[mainSessionKey]?.sessionId).toBe("sess-1");
-    // updateLastRoute must preserve existing updatedAt (activity timestamp)
-    expect(store[mainSessionKey]?.updatedAt).toBe(123);
-    expect(store[mainSessionKey]?.lastChannel).toBe("telegram");
-    expect(store[mainSessionKey]?.lastTo).toBe("12345");
-    expect(store[mainSessionKey]?.deliveryContext).toEqual({
-      channel: "telegram",
-      to: "12345",
-    });
-    expect(store[mainSessionKey]?.responseUsage).toBe("on");
-    expect(store[mainSessionKey]?.queueDebounceMs).toBe(1234);
-    expect(store[mainSessionKey]?.reasoningLevel).toBe("on");
-    expect(store[mainSessionKey]?.elevatedLevel).toBe("on");
-    expect(store[mainSessionKey]?.authProfileOverride).toBe("auth-1");
-    expect(store[mainSessionKey]?.compactionCount).toBe(2);
-  });
-
-  it("updateLastRoute prefers explicit deliveryContext", async () => {
-    const mainSessionKey = "agent:main:main";
-    const { storePath } = await createSessionStoreFixture({
-      prefix: "updateLastRoute",
-      entries: {},
-    });
-
-    await updateLastRoute({
-      storePath,
-      sessionKey: mainSessionKey,
-      channel: "demo-chat",
-      to: "111",
-      accountId: "legacy",
-      deliveryContext: {
-        channel: "telegram",
-        to: "222",
-        accountId: "primary",
-      },
-    });
-
-    const store = loadSessionStore(storePath);
-    expect(store[mainSessionKey]?.lastChannel).toBe("telegram");
-    expect(store[mainSessionKey]?.lastTo).toBe("222");
-    expect(store[mainSessionKey]?.lastAccountId).toBe("primary");
-    expect(store[mainSessionKey]?.deliveryContext).toEqual({
-      channel: "telegram",
-      to: "222",
-      accountId: "primary",
-    });
-  });
-
-  it("updateLastRoute clears threadId when explicit route omits threadId", async () => {
-    const mainSessionKey = "agent:main:main";
-    const { storePath } = await createSessionStoreFixture({
-      prefix: "updateLastRoute",
-      entries: {
-        [mainSessionKey]: buildMainSessionEntry({
-          deliveryContext: {
-            channel: "telegram",
-            to: "222",
-            threadId: "42",
-          },
-          lastChannel: "telegram",
-          lastTo: "222",
-          lastThreadId: "42",
-        }),
-      },
-    });
-
-    await updateLastRoute({
-      storePath,
-      sessionKey: mainSessionKey,
-      deliveryContext: {
-        channel: "telegram",
-        to: "222",
-      },
-    });
-
-    const store = loadSessionStore(storePath);
-    expect(store[mainSessionKey]?.deliveryContext).toEqual({
-      channel: "telegram",
-      to: "222",
-    });
-    expect(store[mainSessionKey]?.lastThreadId).toBeUndefined();
-  });
-
-  it("updateLastRoute records origin + group metadata when ctx is provided", async () => {
-    const sessionKey = "agent:main:demo-chat:group:room-123";
-    const { storePath } = await createSessionStoreFixture({
-      prefix: "updateLastRoute",
-      entries: {},
-    });
-
-    await updateLastRoute({
-      storePath,
-      sessionKey,
-      deliveryContext: {
-        channel: "demo-chat",
-        to: "room-123",
-      },
-      ctx: {
-        Provider: "demo-chat",
-        ChatType: "group",
-        GroupSubject: "Family",
-        From: "room-123",
-      },
-    });
-
-    const store = loadSessionStore(storePath);
-    expect(store[sessionKey]?.subject).toBe("Family");
-    expect(store[sessionKey]?.channel).toBe("demo-chat");
-    expect(store[sessionKey]?.groupId).toBe("room-123");
-    expect(store[sessionKey]?.origin?.label).toBe("Family");
-    expect(store[sessionKey]?.origin?.provider).toBe("demo-chat");
-    expect(store[sessionKey]?.origin?.chatType).toBe("group");
-  });
-
-  it("updateLastRoute skips missing sessions when creation is disabled", async () => {
-    const sessionKey = "agent:main:demo-chat:group:room-123";
-    const { storePath } = await createSessionStoreFixture({
-      prefix: "updateLastRoute-no-create",
-      entries: {},
-    });
-
-    const result = await updateLastRoute({
-      storePath,
-      sessionKey,
-      deliveryContext: {
-        channel: "demo-chat",
-        to: "room-123",
-      },
-      createIfMissing: false,
-    });
-
-    const store = loadSessionStore(storePath);
-    expect(result).toBeNull();
-    expect(store[sessionKey]).toBeUndefined();
-  });
-
-  it("updateLastRoute updates existing sessions when creation is disabled", async () => {
-    const sessionKey = "agent:main:demo-chat:group:room-123";
-    const { storePath } = await createSessionStoreFixture({
-      prefix: "updateLastRoute-existing-no-create",
-      entries: {
-        [sessionKey]: buildMainSessionEntry(),
-      },
-    });
-
-    await updateLastRoute({
-      storePath,
-      sessionKey,
-      deliveryContext: {
-        channel: "demo-chat",
-        to: "room-123",
-      },
-      createIfMissing: false,
-    });
-
-    const store = loadSessionStore(storePath);
-    expect(store[sessionKey]?.lastChannel).toBe("demo-chat");
-    expect(store[sessionKey]?.lastTo).toBe("room-123");
-  });
-
-  it("updateLastRoute does not bump updatedAt on existing sessions (#49515)", async () => {
-    const mainSessionKey = "agent:main:main";
-    const frozenUpdatedAt = 1000;
-    const { storePath } = await createSessionStoreFixture({
-      prefix: "updateLastRoute-preserve-activity",
-      entries: {
-        [mainSessionKey]: buildMainSessionEntry({
-          updatedAt: frozenUpdatedAt,
-        }),
-      },
-    });
-
-    await updateLastRoute({
-      storePath,
-      sessionKey: mainSessionKey,
-      deliveryContext: {
-        channel: "telegram",
-        to: "99999",
-      },
-    });
-
-    const store = loadSessionStore(storePath);
-    // Route updates must not refresh activity timestamps; idle/daily reset
-    // evaluation relies on updatedAt from actual session turns.
-    expect(store[mainSessionKey]?.updatedAt).toBe(frozenUpdatedAt);
-    // Routing fields should still be updated
-    expect(store[mainSessionKey]?.lastChannel).toBe("telegram");
-    expect(store[mainSessionKey]?.lastTo).toBe("99999");
-  });
-
   it("updateSessionStoreEntry preserves existing fields when patching", async () => {
     const sessionKey = "agent:main:main";
     const { storePath } = await createSessionStoreFixture({
@@ -504,6 +279,31 @@ describe("sessions", () => {
 
     const store = loadSessionStore(storePath);
     expect(store[sessionKey]?.thinkingLevel).toBe("low");
+  });
+
+  it("updateSessionStoreEntry persists callback mutations returned as patches", async () => {
+    const sessionKey = "agent:main:main";
+    const { storePath } = await createSessionStoreFixture({
+      prefix: "updateSessionStoreEntry-mutated-patch",
+      entries: {
+        [sessionKey]: {
+          sessionId: "sess-1",
+          updatedAt: 123,
+          displayName: "before",
+        },
+      },
+    });
+
+    await updateSessionStoreEntry({
+      storePath,
+      sessionKey,
+      update: async (entry) => {
+        entry.displayName = "after";
+        return { displayName: entry.displayName };
+      },
+    });
+
+    expect(loadSessionStore(storePath)[sessionKey]?.displayName).toBe("after");
   });
 
   it("updateSessionStore preserves concurrent additions", async () => {
@@ -770,20 +570,8 @@ describe("sessions", () => {
       },
     });
 
-    const createDeferred = <T>() => {
-      let resolve: ((value: T | PromiseLike<T>) => void) | undefined;
-      let reject: ((reason?: unknown) => void) | undefined;
-      const promise = new Promise<T>((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
-      if (!resolve || !reject) {
-        throw new Error("Expected deferred callbacks to be initialized");
-      }
-      return { promise, resolve, reject };
-    };
-    const firstStarted = createDeferred<void>();
-    const releaseFirst = createDeferred<void>();
+    const firstStarted = createDeferred();
+    const releaseFirst = createDeferred();
 
     const p1 = updateSessionStoreEntry({
       storePath,
@@ -854,7 +642,37 @@ describe("sessions", () => {
     expect(store[mainSessionKey]?.thinkingLevel).toBe("high");
   });
 
-  it("updateSessionStore uses the writer-owned mutable cache without disk read or parse", async () => {
+  it("updateSessionStoreEntry can skip maintenance for existing-entry metadata writes", async () => {
+    const mainSessionKey = "agent:main:main";
+    const staleSessionKey = "agent:main:stale";
+    const { storePath } = await createSessionStoreFixture({
+      prefix: "updateSessionStoreEntry-skip-maintenance",
+      entries: {
+        [mainSessionKey]: {
+          sessionId: "sess-1",
+          updatedAt: Date.now(),
+          thinkingLevel: "low",
+        },
+        [staleSessionKey]: {
+          sessionId: "sess-stale",
+          updatedAt: 1,
+        },
+      },
+    });
+
+    await updateSessionStoreEntry({
+      storePath,
+      sessionKey: mainSessionKey,
+      skipMaintenance: true,
+      update: async () => ({ thinkingLevel: "high" }),
+    });
+
+    const store = loadSessionStore(storePath);
+    expect(store[mainSessionKey]?.thinkingLevel).toBe("high");
+    expect(store[staleSessionKey]?.sessionId).toBe("sess-stale");
+  });
+
+  it("updateSessionStore uses the writer-owned mutable cache without disk read", async () => {
     const mainSessionKey = "agent:main:main";
     const { storePath } = await createSessionStoreFixture({
       prefix: "updateSessionStore-mutable-cache",
@@ -870,7 +688,6 @@ describe("sessions", () => {
     expect(loadSessionStore(storePath)[mainSessionKey]?.thinkingLevel).toBe("low");
 
     const readSpy = vi.spyOn(fsSync, "readFileSync");
-    const parseSpy = vi.spyOn(JSON, "parse");
     try {
       await updateSessionStore(
         storePath,
@@ -888,10 +705,8 @@ describe("sessions", () => {
       );
 
       expect(readSpy).not.toHaveBeenCalled();
-      expect(parseSpy).not.toHaveBeenCalled();
     } finally {
       readSpy.mockRestore();
-      parseSpy.mockRestore();
     }
 
     const store = loadSessionStore(storePath, { skipCache: true });

@@ -5,8 +5,13 @@
   },
   "enabledByDefault": true,
   "providers": ["comfy"],
-  "providerAuthEnvVars": {
-    "comfy": ["COMFY_API_KEY", "COMFY_CLOUD_API_KEY"]
+  "setup": {
+    "providers": [
+      {
+        "id": "comfy",
+        "envVars": ["COMFY_API_KEY", "COMFY_CLOUD_API_KEY"]
+      }
+    ]
   },
   "providerAuthChoices": [
     {
@@ -220,6 +225,18 @@
         "type": "integer",
         "minimum": 1000
       },
+      "dimensions": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "widthNodeId": { "type": "string" },
+          "heightNodeId": { "type": "string" },
+          "widthInputName": { "type": "string" },
+          "heightInputName": { "type": "string" },
+          "baseSize": { "type": "integer", "minimum": 64 }
+        },
+        "required": ["widthNodeId", "heightNodeId"]
+      },
       "image": {
         "type": "object",
         "additionalProperties": false,
@@ -232,7 +249,19 @@
           "inputImageInputName": { "type": "string" },
           "outputNodeId": { "type": "string" },
           "pollIntervalMs": { "type": "integer", "minimum": 100 },
-          "timeoutMs": { "type": "integer", "minimum": 1000 }
+          "timeoutMs": { "type": "integer", "minimum": 1000 },
+          "dimensions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "widthNodeId": { "type": "string" },
+              "heightNodeId": { "type": "string" },
+              "widthInputName": { "type": "string" },
+              "heightInputName": { "type": "string" },
+              "baseSize": { "type": "integer", "minimum": 64 }
+            },
+            "required": ["widthNodeId", "heightNodeId"]
+          }
         }
       },
       "video": {

@@ -1,3 +1,4 @@
+// Extension runtime dependency contract tests cover runtime dependency placement for extensions.
 import fs from "node:fs";
 import { builtinModules } from "node:module";
 import path from "node:path";
@@ -21,10 +22,10 @@ const OPTIONAL_UNDECLARED_RUNTIME_IMPORTS = new Map<string, Set<string>>([
   ],
   [
     "extensions/discord",
-    // Prefer the pure-JS opusscript decoder, but keep the optional native decoder
-    // fallback for users who install it themselves.
+    // @discordjs/voice still probes the native addon in its dependency report path.
     new Set(["@discordjs/opus"]),
   ],
+  ["extensions/qa-lab", new Set(["crabline"])],
 ]);
 const INDIRECT_RUNTIME_DEPENDENCIES = new Map<string, Set<string>>([
   [
@@ -51,6 +52,19 @@ const INDIRECT_RUNTIME_DEPENDENCIES = new Map<string, Set<string>>([
     "extensions/tlon",
     // The Tlon plugin manifest exposes the bundled skill from this package path.
     new Set(["@tloncorp/tlon-skill"]),
+  ],
+]);
+const COMPUTED_RUNTIME_DEPENDENCIES = new Map<string, Set<string>>([
+  [
+    "extensions/discord",
+    // Bundled at build time into the served Discord Activity shell asset rather than
+    // imported by plugin runtime code; see scripts/build-discord-activity-sdk.mjs.
+    new Set(["@discord/embedded-app-sdk"]),
+  ],
+  [
+    "extensions/lobster",
+    // Keep Lobster external to the plugin bundle; its computed core import is resolved at runtime.
+    new Set(["@clawdbot/lobster"]),
   ],
 ]);
 
@@ -237,7 +251,6 @@ function allDependencyNames(manifest: PackageManifest): string[] {
 function isDiscordPackageDependency(dependencyName: string): boolean {
   return (
     dependencyName === "discord-api-types" ||
-    dependencyName === "opusscript" ||
     dependencyName.startsWith("@discordjs/") ||
     dependencyName.startsWith("@snazzah/")
   );
@@ -285,6 +298,20 @@ describe("extension runtime dependency manifests", () => {
     expect(manifest.dependencies?.json5).not.toBe("");
   });
 
+  for (const [extensionDir, dependencies] of COMPUTED_RUNTIME_DEPENDENCIES) {
+    it(`${extensionDir} declares every computed runtime dependency`, () => {
+      const manifest = readPackageManifest(path.join(extensionDir, "package.json"));
+      const declared = new Set([
+        ...Object.keys(manifest.dependencies ?? {}),
+        ...Object.keys(manifest.optionalDependencies ?? {}),
+      ]);
+
+      expect([...dependencies].filter((dependencyName) => !declared.has(dependencyName))).toEqual(
+        [],
+      );
+    });
+  }
+
   for (const manifestPath of listPackageManifests(EXTENSION_ROOT)) {
     const extensionDir = toRepoPath(path.dirname(manifestPath));
 
@@ -322,6 +349,7 @@ describe("extension runtime dependency manifests", () => {
         ...Object.keys(manifest.optionalDependencies ?? {}),
       ].toSorted();
       const allowedIndirect = INDIRECT_RUNTIME_DEPENDENCIES.get(extensionDir) ?? new Set<string>();
+      const allowedComputed = COMPUTED_RUNTIME_DEPENDENCIES.get(extensionDir) ?? new Set<string>();
       const runtimeText = listRuntimeFiles(extensionDir)
         .map((filePath) => fs.readFileSync(path.resolve(REPO_ROOT, filePath), "utf8"))
         .concat(readManifestText(extensionDir))
@@ -329,7 +357,9 @@ describe("extension runtime dependency manifests", () => {
 
       const unused = declared.filter(
         (dependencyName) =>
-          !allowedIndirect.has(dependencyName) && !runtimeText.includes(dependencyName),
+          !allowedIndirect.has(dependencyName) &&
+          !allowedComputed.has(dependencyName) &&
+          !runtimeText.includes(dependencyName),
       );
 
       expect(unused).toStrictEqual([]);

@@ -1,3 +1,8 @@
+/**
+ * agents_list built-in tool.
+ *
+ * Lists configured or allowed agent ids plus model/runtime metadata for subagent spawn decisions.
+ */
 import { Type } from "typebox";
 import { getRuntimeConfig } from "../../config/config.js";
 import {
@@ -6,6 +11,7 @@ import {
   parseAgentSessionKey,
 } from "../../routing/session-key.js";
 import { resolveModelAgentRuntimeMetadata } from "../agent-runtime-metadata.js";
+import { listAgentIds } from "../agent-scope-config.js";
 import { resolveAgentConfig, resolveAgentEffectiveModelPrimary } from "../agent-scope.js";
 import { resolveDefaultModelForAgent } from "../model-selection.js";
 import { resolveSubagentAllowedTargetIds } from "../subagent-target-policy.js";
@@ -14,6 +20,43 @@ import { jsonResult } from "./common.js";
 import { resolveInternalSessionKey, resolveMainSessionAlias } from "./sessions-helpers.js";
 
 const AgentsListToolSchema = Type.Object({});
+const AgentRuntimeSourceSchema = Type.Union([
+  Type.Literal("env"),
+  Type.Literal("agent"),
+  Type.Literal("defaults"),
+  Type.Literal("model"),
+  Type.Literal("provider"),
+  Type.Literal("implicit"),
+  Type.Literal("session"),
+  Type.Literal("session-key"),
+]);
+const AgentsListOutputSchema = Type.Object(
+  {
+    requester: Type.String(),
+    allowAny: Type.Boolean(),
+    agents: Type.Array(
+      Type.Object(
+        {
+          id: Type.String(),
+          name: Type.Optional(Type.String()),
+          configured: Type.Boolean(),
+          model: Type.Optional(Type.String()),
+          agentRuntime: Type.Optional(
+            Type.Object(
+              {
+                id: Type.String(),
+                source: AgentRuntimeSourceSchema,
+              },
+              { additionalProperties: false },
+            ),
+          ),
+        },
+        { additionalProperties: false },
+      ),
+    ),
+  },
+  { additionalProperties: false },
+);
 
 type AgentListEntry = {
   id: string;
@@ -22,7 +65,15 @@ type AgentListEntry = {
   model?: string;
   agentRuntime?: {
     id: string;
-    source: "env" | "agent" | "defaults" | "model" | "provider" | "implicit" | "session-key";
+    source:
+      | "env"
+      | "agent"
+      | "defaults"
+      | "model"
+      | "provider"
+      | "implicit"
+      | "session"
+      | "session-key";
   };
 };
 
@@ -34,8 +85,9 @@ export function createAgentsListTool(opts?: {
   return {
     label: "Agents",
     name: "agents_list",
-    description: 'List agent ids allowed for `sessions_spawn runtime="subagent"`.',
+    description: 'List ids allowed for `sessions_spawn(runtime:"subagent")`.',
     parameters: AgentsListToolSchema,
+    outputSchema: AgentsListOutputSchema,
     execute: async () => {
       const cfg = getRuntimeConfig();
       const { mainKey, alias } = resolveMainSessionAlias(cfg);
@@ -58,7 +110,7 @@ export function createAgentsListTool(opts?: {
         cfg?.agents?.defaults?.subagents?.allowAgents;
 
       const configuredAgents = Array.isArray(cfg.agents?.list) ? cfg.agents?.list : [];
-      const configuredIds = configuredAgents.map((entry) => normalizeAgentId(entry.id));
+      const configuredIds = listAgentIds(cfg);
       const configuredNameMap = new Map<string, string>();
       for (const entry of configuredAgents) {
         const name = entry?.name?.trim() ?? "";

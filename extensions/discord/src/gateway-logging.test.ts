@@ -1,3 +1,4 @@
+// Discord tests cover gateway logging plugin behavior.
 import { EventEmitter } from "node:events";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -16,7 +17,8 @@ const makeRuntime = () => ({
 
 describe("attachDiscordGatewayLogging", () => {
   beforeAll(async () => {
-    ({ logVerbose } = await import("openclaw/plugin-sdk/runtime-env"));
+    const { logVerbose: loadedLogVerbose } = await import("openclaw/plugin-sdk/runtime-env");
+    logVerbose = loadedLogVerbose;
     ({ attachDiscordGatewayLogging } = await import("./gateway-logging.js"));
   });
 

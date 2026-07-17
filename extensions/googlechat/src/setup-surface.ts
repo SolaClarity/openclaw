@@ -1,3 +1,4 @@
+// Googlechat plugin module implements setup surface behavior.
 import {
   addWildcardAllowFrom,
   applySetupAccountConfigPatch,
@@ -144,7 +145,10 @@ export const googlechatSetupWizard: ChannelSetupWizard = {
   prepare: async ({ cfg, accountId, credentialValues, prompter }) => {
     const envReady =
       accountId === DEFAULT_ACCOUNT_ID &&
-      (Boolean(process.env[ENV_SERVICE_ACCOUNT]) || Boolean(process.env[ENV_SERVICE_ACCOUNT_FILE]));
+      Boolean(
+        normalizeOptionalString(process.env[ENV_SERVICE_ACCOUNT]) ||
+        normalizeOptionalString(process.env[ENV_SERVICE_ACCOUNT_FILE]),
+      );
     if (envReady) {
       const useEnv = await prompter.confirm({
         message: t("wizard.googlechat.useEnvPrompt"),

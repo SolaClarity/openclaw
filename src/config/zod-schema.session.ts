@@ -1,7 +1,8 @@
+// Defines session-related Zod schema fragments for config parsing.
+import { normalizeStringifiedOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { z } from "zod";
 import { parseByteSize } from "../cli/parse-bytes.js";
 import { parseDurationMs } from "../cli/parse-duration.js";
-import { normalizeStringifiedOptionalString } from "../shared/string-coerce.js";
 import { ElevatedAllowFromSchema } from "./zod-schema.agent-runtime.js";
 import { createAllowDenyChannelRulesSchema } from "./zod-schema.allowdeny.js";
 import {
@@ -22,6 +23,25 @@ const SessionResetConfigSchema = z
     idleMinutes: z.number().int().positive().optional(),
   })
   .strict();
+
+const PositiveDurationSchema = z.union([z.string(), z.number()]).superRefine((value, ctx) => {
+  try {
+    const ms = parseDurationMs(normalizeStringifiedOptionalString(value) ?? "", {
+      defaultUnit: "d",
+    });
+    if (ms <= 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "duration must be positive (use ms, s, m, h, d), e.g. 30d",
+      });
+    }
+  } catch {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "invalid duration (use ms, s, m, h, d)",
+    });
+  }
+});
 
 export const SessionSendPolicySchema = createAllowDenyChannelRulesSchema();
 
@@ -83,44 +103,17 @@ export const SessionSchema = z
     maintenance: z
       .object({
         mode: z.enum(["enforce", "warn"]).optional(),
-        pruneAfter: z.union([z.string(), z.number()]).optional(),
+        pruneAfter: PositiveDurationSchema.optional(),
         /** @deprecated Use pruneAfter instead. */
         pruneDays: z.number().int().positive().optional(),
         maxEntries: z.number().int().positive().optional(),
-        rotateBytes: z.union([z.string(), z.number()]).optional(),
-        resetArchiveRetention: z.union([z.string(), z.number(), z.literal(false)]).optional(),
-        maxDiskBytes: z.union([z.string(), z.number()]).optional(),
+        resetArchiveRetention: z.union([PositiveDurationSchema, z.literal(false)]).optional(),
+        maxDiskBytes: z.union([z.string(), z.number(), z.literal(false)]).optional(),
         highWaterBytes: z.union([z.string(), z.number()]).optional(),
       })
       .strict()
       .superRefine((val, ctx) => {
-        if (val.pruneAfter !== undefined) {
-          try {
-            parseDurationMs(normalizeStringifiedOptionalString(val.pruneAfter) ?? "", {
-              defaultUnit: "d",
-            });
-          } catch {
-            ctx.addIssue({
-              code: z.ZodIssueCode.custom,
-              path: ["pruneAfter"],
-              message: "invalid duration (use ms, s, m, h, d)",
-            });
-          }
-        }
-        if (val.resetArchiveRetention !== undefined && val.resetArchiveRetention !== false) {
-          try {
-            parseDurationMs(normalizeStringifiedOptionalString(val.resetArchiveRetention) ?? "", {
-              defaultUnit: "d",
-            });
-          } catch {
-            ctx.addIssue({
-              code: z.ZodIssueCode.custom,
-              path: ["resetArchiveRetention"],
-              message: "invalid duration (use ms, s, m, h, d)",
-            });
-          }
-        }
-        if (val.maxDiskBytes !== undefined) {
+        if (val.maxDiskBytes !== undefined && val.maxDiskBytes !== false) {
           try {
             parseByteSize(normalizeStringifiedOptionalString(val.maxDiskBytes) ?? "", {
               defaultUnit: "b",
@@ -152,11 +145,17 @@ export const SessionSchema = z
   .strict()
   .optional();
 
+const ResponseUsageModeSchema = z.enum(["on", "off", "tokens", "full"]);
+
 export const MessagesSchema = z
   .object({
     messagePrefix: z.string().optional(),
     visibleReplies: VisibleRepliesSchema.optional(),
     responsePrefix: z.string().optional(),
+    usageTemplate: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
+    responseUsage: z
+      .union([ResponseUsageModeSchema, z.record(z.string(), ResponseUsageModeSchema)])
+      .optional(),
     groupChat: GroupChatSchema,
     queue: QueueSchema,
     inbound: InboundDebounceSchema,
@@ -170,6 +169,7 @@ export const MessagesSchema = z
         enabled: z.boolean().optional(),
         emojis: z
           .object({
+            queued: z.string().optional(),
             thinking: z.string().optional(),
             tool: z.string().optional(),
             coding: z.string().optional(),

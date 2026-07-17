@@ -1,12 +1,20 @@
+/**
+ * Builds model visibility policies with configured fallbacks included.
+ */
 import { resolveAgentModelFallbackValues } from "../config/model-input.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { resolveAgentModelFallbacksOverride } from "./agent-scope.js";
+import { resolveAgentConfig, resolveAgentModelFallbacksOverride } from "./agent-scope.js";
 import type { ModelCatalogEntry } from "./model-catalog.types.js";
 import type { ModelManifestNormalizationContext } from "./model-selection-normalize.js";
 import {
   createModelVisibilityPolicyWithFallbacks,
   type ModelVisibilityPolicy,
 } from "./model-selection-shared.js";
+
+export const RUNTIME_MODEL_VISIBILITY_NORMALIZATION = {
+  allowManifestNormalization: true,
+  allowPluginNormalization: true,
+} as const;
 
 function resolveAllowedFallbacks(params: { cfg: OpenClawConfig; agentId?: string }): string[] {
   if (params.agentId) {
@@ -25,6 +33,8 @@ export function createModelVisibilityPolicy(
     defaultProvider: string;
     defaultModel?: string;
     agentId?: string;
+    allowManifestNormalization?: boolean;
+    allowPluginNormalization?: boolean;
   } & ModelManifestNormalizationContext,
 ): ModelVisibilityPolicy {
   return createModelVisibilityPolicyWithFallbacks({
@@ -36,6 +46,14 @@ export function createModelVisibilityPolicy(
       cfg: params.cfg,
       agentId: params.agentId,
     }),
+    additionalConfiguredModelRefs: params.agentId
+      ? Object.keys(resolveAgentConfig(params.cfg, params.agentId)?.models ?? {})
+      : [],
+    // Model visibility is used by lightweight status/list paths. Keep plugin
+    // manifest normalization opt-in so those paths do not load plugin runtime
+    // metadata unless a caller explicitly needs it.
+    allowManifestNormalization: params.allowManifestNormalization ?? false,
+    allowPluginNormalization: params.allowPluginNormalization ?? false,
     manifestPlugins: params.manifestPlugins,
   });
 }

@@ -1,3 +1,5 @@
+// Discord tests cover message handler.queue plugin behavior.
+import { getEventListeners } from "node:events";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DiscordRetryableInboundError } from "./inbound-dedupe.js";
@@ -11,26 +13,8 @@ import {
   createDiscordPreflightContext,
 } from "./message-handler.test-helpers.js";
 
-const earlyTypingMocks = vi.hoisted(() => ({
-  createDiscordRestClient: vi.fn(() => ({
-    token: "test-token",
-    rest: { kind: "discord-rest" },
-    account: { accountId: "default", config: {} },
-  })),
-  sendTyping: vi.fn(async () => {}),
-}));
-
-vi.mock("../client.js", () => ({
-  createDiscordRestClient: earlyTypingMocks.createDiscordRestClient,
-}));
-
-vi.mock("./typing.js", () => ({
-  sendTyping: earlyTypingMocks.sendTyping,
-}));
-
 type SetStatusFn = (patch: Record<string, unknown>) => void;
 type MockCallSource = { mock: { calls: Array<Array<unknown>> } };
-
 function mockCall(source: MockCallSource, label: string, callIndex = 0): Array<unknown> {
   const call = source.mock.calls[callIndex];
   if (!call) {
@@ -104,20 +88,22 @@ function createPreflightContext(channelId = "ch-1") {
     cfg,
     accountId: "default",
     token: "test-token",
+    runtime: {
+      log: vi.fn(),
+      error: vi.fn(),
+      exit: (code: number): never => {
+        throw new Error(`exit ${code}`);
+      },
+    },
     textLimit: 2_000,
     replyToMode: "off" as const,
     discordConfig,
-  };
-}
-
-function createAcceptedDmPreflightContext(overrides: Record<string, unknown> = {}) {
-  return {
-    ...createPreflightContext("dm-1"),
-    isDirectMessage: true,
-    isGuildMessage: false,
-    isGroupDm: false,
     messageText: "hello",
-    ...overrides,
+    isDirectMessage: false,
+    isGuildMessage: true,
+    isGroupDm: false,
+    inboundEventKind: "message" as const,
+    effectiveWasMentioned: false,
   };
 }
 
@@ -172,126 +158,7 @@ async function createLifecycleStopScenario(params: {
 
 describe("createDiscordMessageHandler queue behavior", () => {
   beforeEach(() => {
-    earlyTypingMocks.createDiscordRestClient.mockReset().mockReturnValue({
-      token: "test-token",
-      rest: { kind: "discord-rest" },
-      account: { accountId: "default", config: {} },
-    });
-    earlyTypingMocks.sendTyping.mockReset().mockResolvedValue(undefined);
-  });
-
-  it("sends an accepted DM typing cue before queued processing starts", async () => {
-    preflightDiscordMessageMock.mockReset();
-    processDiscordMessageMock.mockReset();
-    preflightDiscordMessageMock.mockResolvedValue(createAcceptedDmPreflightContext());
-    processDiscordMessageMock.mockResolvedValue(undefined);
-
-    const handler = createDiscordMessageHandler(createDiscordHandlerParams());
-    await expect(
-      handler(createMessageData("m-typing", "dm-1") as never, {} as never),
-    ).resolves.toBeUndefined();
-
-    await flushQueueWork();
-
-    expect(earlyTypingMocks.createDiscordRestClient).toHaveBeenCalledTimes(1);
-    const [restClientParams] = mockCall(
-      earlyTypingMocks.createDiscordRestClient,
-      "createDiscordRestClient",
-    );
-    expect((restClientParams as { accountId?: unknown } | undefined)?.accountId).toBe("default");
-    expect((restClientParams as { token?: unknown } | undefined)?.token).toBe("test-token");
-    expect(earlyTypingMocks.sendTyping).toHaveBeenCalledWith({
-      rest: { kind: "discord-rest" },
-      channelId: "dm-1",
-    });
-    expect(earlyTypingMocks.sendTyping.mock.invocationCallOrder[0]).toBeLessThan(
-      processDiscordMessageMock.mock.invocationCallOrder[0],
-    );
-  });
-
-  it("keeps accepted DM dispatch running when the early typing cue fails", async () => {
-    preflightDiscordMessageMock.mockReset();
-    processDiscordMessageMock.mockReset();
-    earlyTypingMocks.sendTyping.mockRejectedValueOnce(new Error("typing failed"));
-    preflightDiscordMessageMock.mockResolvedValue(createAcceptedDmPreflightContext());
-    processDiscordMessageMock.mockResolvedValue(undefined);
-
-    const handler = createDiscordMessageHandler(createDiscordHandlerParams());
-    await expect(
-      handler(createMessageData("m-typing-fails", "dm-1") as never, {} as never),
-    ).resolves.toBeUndefined();
-
-    await flushQueueWork();
-
-    expect(earlyTypingMocks.sendTyping).toHaveBeenCalledTimes(1);
-    expect(processDiscordMessageMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not send early typing when preflight rejects the message", async () => {
-    preflightDiscordMessageMock.mockReset();
-    processDiscordMessageMock.mockReset();
-    preflightDiscordMessageMock.mockResolvedValue(null);
-
-    const handler = createDiscordMessageHandler(createDiscordHandlerParams());
-    await expect(
-      handler(createMessageData("m-rejected", "dm-1") as never, {} as never),
-    ).resolves.toBeUndefined();
-
-    await flushQueueWork();
-
-    expect(earlyTypingMocks.sendTyping).not.toHaveBeenCalled();
-    expect(processDiscordMessageMock).not.toHaveBeenCalled();
-  });
-
-  it("does not send early typing when typing mode is not instant", async () => {
-    preflightDiscordMessageMock.mockReset();
-    processDiscordMessageMock.mockReset();
-    preflightDiscordMessageMock.mockResolvedValue(
-      createAcceptedDmPreflightContext({
-        cfg: {
-          ...createPreflightContext().cfg,
-          agents: {
-            defaults: {
-              typingMode: "message",
-            },
-          },
-        },
-      }),
-    );
-    processDiscordMessageMock.mockResolvedValue(undefined);
-
-    const handler = createDiscordMessageHandler(createDiscordHandlerParams());
-    await expect(
-      handler(createMessageData("m-message-mode", "dm-1") as never, {} as never),
-    ).resolves.toBeUndefined();
-
-    await flushQueueWork();
-
-    expect(earlyTypingMocks.sendTyping).not.toHaveBeenCalled();
-    expect(processDiscordMessageMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not send early typing for guild messages", async () => {
-    preflightDiscordMessageMock.mockReset();
-    processDiscordMessageMock.mockReset();
-    preflightDiscordMessageMock.mockResolvedValue(
-      createAcceptedDmPreflightContext({
-        isDirectMessage: false,
-        isGuildMessage: true,
-        messageChannelId: "guild-channel",
-      }),
-    );
-    processDiscordMessageMock.mockResolvedValue(undefined);
-
-    const handler = createDiscordMessageHandler(createDiscordHandlerParams());
-    await expect(
-      handler(createMessageData("m-guild", "guild-channel") as never, {} as never),
-    ).resolves.toBeUndefined();
-
-    await flushQueueWork();
-
-    expect(earlyTypingMocks.sendTyping).not.toHaveBeenCalled();
-    expect(processDiscordMessageMock).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
   });
 
   it("resets busy counters when the handler is created", () => {
@@ -572,6 +439,22 @@ describe("createDiscordMessageHandler queue behavior", () => {
 
     await finish();
     expect(setStatus.mock.calls.length).toBe(callsBeforeStop);
+  });
+
+  it("removes lifecycle abort listeners after handler deactivation", () => {
+    const abortController = new AbortController();
+    const initialListenerCount = getEventListeners(abortController.signal, "abort").length;
+    const handler = createDiscordMessageHandler(
+      createDiscordHandlerParams({ abortSignal: abortController.signal }),
+    );
+
+    expect(getEventListeners(abortController.signal, "abort")).toHaveLength(
+      initialListenerCount + 2,
+    );
+
+    handler.deactivate();
+
+    expect(getEventListeners(abortController.signal, "abort")).toHaveLength(initialListenerCount);
   });
 
   it("skips queued runs that have not started yet after deactivation", async () => {

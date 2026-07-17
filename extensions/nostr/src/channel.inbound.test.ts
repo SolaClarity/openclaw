@@ -1,11 +1,14 @@
+import type { dispatchInboundDirectDm as DispatchInboundDirectDm } from "openclaw/plugin-sdk/channel-inbound";
+// Nostr tests cover channel.inbound plugin behavior.
 import { createStartAccountContext } from "openclaw/plugin-sdk/channel-test-helpers";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { PluginRuntime } from "../runtime-api.js";
 import { startNostrGatewayAccount } from "./gateway.js";
 import { setNostrRuntime } from "./runtime.js";
 import { buildResolvedNostrAccount } from "./test-fixtures.js";
 
 const mocks = vi.hoisted(() => ({
+  dispatchInboundDirectDm: vi.fn(),
   normalizePubkey: vi.fn((value: string) =>
     value
       .trim()
@@ -15,6 +18,10 @@ const mocks = vi.hoisted(() => ({
   startNostrBus: vi.fn(),
 }));
 
+vi.mock("openclaw/plugin-sdk/channel-inbound", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/channel-inbound")>()),
+  dispatchInboundDirectDm: mocks.dispatchInboundDirectDm,
+}));
 vi.mock("./nostr-bus.js", () => ({
   DEFAULT_RELAYS: ["wss://relay.example.com"],
   startNostrBus: mocks.startNostrBus,
@@ -24,6 +31,10 @@ vi.mock("./nostr-key-utils.js", () => ({
   getPublicKeyFromPrivate: vi.fn(() => "bot-pubkey"),
   normalizePubkey: mocks.normalizePubkey,
 }));
+
+beforeAll(async () => {
+  await import("./inbound-direct-dm-runtime.js");
+});
 
 function createMockBus() {
   return {
@@ -90,13 +101,24 @@ async function startGatewayHarness(params: {
   const bus = createMockBus();
   setNostrRuntime(harness.runtime);
   mocks.startNostrBus.mockResolvedValueOnce(bus as never);
+  const abort = new AbortController();
 
-  const cleanup = (await startNostrGatewayAccount(
+  const task = startNostrGatewayAccount(
     createStartAccountContext({
       account: params.account,
       cfg: params.cfg,
+      abortSignal: abort.signal,
     }),
-  )) as { stop: () => void };
+  );
+  await vi.waitFor(() => {
+    expect(mocks.startNostrBus).toHaveBeenCalledTimes(1);
+  });
+  const cleanup = {
+    stop: async () => {
+      abort.abort();
+      await task;
+    },
+  };
 
   return { harness, bus, cleanup };
 }
@@ -111,6 +133,7 @@ function mockCallArg(mock: ReturnType<typeof vi.fn>, callIndex = 0, argIndex = 0
 
 describe("nostr inbound gateway path", () => {
   afterEach(() => {
+    mocks.dispatchInboundDirectDm.mockReset();
     mocks.normalizePubkey.mockClear();
     mocks.startNostrBus.mockReset();
   });
@@ -139,19 +162,23 @@ describe("nostr inbound gateway path", () => {
     expect(sendPairingReply).toHaveBeenCalledTimes(1);
     expect(mockCallArg(sendPairingReply)).toContain("Pairing code:");
 
-    cleanup.stop();
+    await cleanup.stop();
   });
 
   it("routes allowed DMs through the standard reply pipeline", async () => {
-    const { harness, cleanup } = await startGatewayHarness({
+    mocks.dispatchInboundDirectDm.mockImplementationOnce(
+      async (params: Parameters<typeof DispatchInboundDirectDm>[0]) => {
+        await params.deliver({ text: "|a|b|" });
+      },
+    );
+    const { cleanup } = await startGatewayHarness({
       account: buildResolvedNostrAccount({
         publicKey: "bot-pubkey",
         config: { dmPolicy: "allowlist", allowFrom: ["nostr:sender-pubkey"] },
       }),
       cfg: {
-        session: { store: { type: "jsonl" } },
         commands: { useAccessGroups: true },
-      } as never,
+      },
     });
 
     const options = mockCallArg(mocks.startNostrBus) as {
@@ -169,19 +196,20 @@ describe("nostr inbound gateway path", () => {
       createdAt: 1_710_000_000,
     });
 
-    expect(harness.recordInboundSession).toHaveBeenCalledTimes(1);
-    expect(harness.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
-    const ctx = (
-      mockCallArg(harness.dispatchReplyWithBufferedBlockDispatcher) as {
-        ctx?: Record<string, unknown>;
-      }
-    ).ctx;
-    expect(ctx?.BodyForAgent).toBe("hello from nostr");
-    expect(ctx?.SenderId).toBe("sender-pubkey");
-    expect(ctx?.MessageSid).toBe("event-123");
-    expect(ctx?.CommandAuthorized).toBe(true);
+    expect(mocks.dispatchInboundDirectDm).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "nostr",
+        accountId: "default",
+        peer: { kind: "direct", id: "sender-pubkey" },
+        senderId: "sender-pubkey",
+        rawBody: "hello from nostr",
+        messageId: "event-123",
+        timestamp: 1_710_000_000_000,
+        commandAuthorized: true,
+      }),
+    );
     expect(sendReply).toHaveBeenCalledWith("converted:|a|b|");
 
-    cleanup.stop();
+    await cleanup.stop();
   });
 });

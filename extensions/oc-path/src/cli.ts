@@ -32,15 +32,16 @@ import {
   type OcPath,
 } from "./oc-path/index.js";
 
-export type OutputRuntimeEnv = {
+type OutputRuntimeEnv = {
   writeStdout(value: string): void;
   error(value: string): void;
   exit(code: number): void;
 };
 
-export interface PathCommandOptions {
+interface PathCommandOptions {
   readonly json?: boolean;
   readonly human?: boolean;
+  readonly valueJson?: boolean;
   readonly cwd?: string;
   readonly file?: string;
   readonly dryRun?: boolean;
@@ -65,7 +66,7 @@ const defaultRuntime: OutputRuntimeEnv = {
 
 // Defense-in-depth: replace the redaction sentinel with `[REDACTED]`
 // before writing, even if upstream emits it.
-export function scrubSentinel(s: string): string {
+function scrubSentinel(s: string): string {
   if (!s.includes(REDACTED_SENTINEL)) {
     return s;
   }
@@ -214,7 +215,7 @@ function splitDiffLines(s: string): readonly string[] {
   return s === "" ? [] : s.split("\n");
 }
 
-export function formatUnifiedDiff(oldBytes: string, newBytes: string, fsPath: string): string {
+function formatUnifiedDiff(oldBytes: string, newBytes: string, fsPath: string): string {
   if (oldBytes === newBytes) {
     return "";
   }
@@ -269,7 +270,7 @@ export function formatUnifiedDiff(oldBytes: string, newBytes: string, fsPath: st
 
 // ---------- Commands -----------------------------------------------------
 
-export async function pathResolveCommand(
+async function pathResolveCommand(
   pathStr: string | undefined,
   options: PathCommandOptions,
   runtime: OutputRuntimeEnv,
@@ -303,7 +304,7 @@ export async function pathResolveCommand(
   emit(runtime, mode, { resolved: true, ocPath: pathStr, match }, () => formatMatchHuman(match));
 }
 
-export async function pathSetCommand(
+async function pathSetCommand(
   pathStr: string | undefined,
   value: string | undefined,
   options: PathCommandOptions,
@@ -334,7 +335,9 @@ export async function pathSetCommand(
   const oldBytes = await fs.readFile(fsPath, "utf-8");
   const ast = await loadAst(fsPath, ocPath.file);
 
-  const result = catchSentinel("set", runtime, mode, () => setOcPath(ast, ocPath, value));
+  const result = catchSentinel("set", runtime, mode, () =>
+    setOcPath(ast, ocPath, value, { valueJson: options.valueJson === true }),
+  );
   if (result === null) {
     return;
   }
@@ -355,6 +358,8 @@ export async function pathSetCommand(
     return;
   }
 
+  const byteLength = Buffer.byteLength(newBytes, "utf8");
+
   if (options.dryRun === true) {
     const diff = options.diff === true ? formatUnifiedDiff(oldBytes, newBytes, fsPath) : undefined;
     emit(
@@ -364,7 +369,7 @@ export async function pathSetCommand(
       () =>
         diff !== undefined
           ? diff || `--dry-run: no byte changes for ${fsPath}`
-          : `--dry-run: would write ${newBytes.length} bytes to ${fsPath}\n${newBytes}`,
+          : `--dry-run: would write ${byteLength} bytes to ${fsPath}\n${newBytes}`,
     );
     return;
   }
@@ -372,12 +377,12 @@ export async function pathSetCommand(
   emit(
     runtime,
     mode,
-    { ok: true, dryRun: false, bytesWritten: newBytes.length, fsPath },
-    () => `wrote ${newBytes.length} bytes to ${fsPath}`,
+    { ok: true, dryRun: false, bytesWritten: byteLength, fsPath },
+    () => `wrote ${byteLength} bytes to ${fsPath}`,
   );
 }
 
-export async function pathFindCommand(
+async function pathFindCommand(
   patternStr: string | undefined,
   options: PathCommandOptions,
   runtime: OutputRuntimeEnv,
@@ -429,7 +434,7 @@ export async function pathFindCommand(
   }
 }
 
-export function pathValidateCommand(
+function pathValidateCommand(
   pathStr: string | undefined,
   options: PathCommandOptions,
   runtime: OutputRuntimeEnv,
@@ -487,7 +492,7 @@ export function pathValidateCommand(
   }
 }
 
-export async function pathEmitCommand(
+async function pathEmitCommand(
   fileArg: string | undefined,
   options: PathCommandOptions,
   runtime: OutputRuntimeEnv,
@@ -553,6 +558,7 @@ export function registerPathCli(program: Command): void {
       .description("Write a leaf value at an oc:// path")
       .argument("<oc-path>", "oc:// path to write")
       .argument("<value>", "string value to write")
+      .option("--value-json", "Parse <value> as JSON for JSON/JSONC/JSONL leaf replacement")
       .option("--dry-run", "Print bytes without writing")
       .option("--diff", "With --dry-run, print a unified diff instead of full bytes"),
   ).action(async (pathStr: string, value: string, opts: PathCommandOptions) => {

@@ -66,7 +66,7 @@ function buildRuntime(
         resolveStorePath: vi.fn(() => ""),
         recordInboundSession: vi.fn(async () => undefined),
       },
-      turn: { run: vi.fn(async () => undefined) },
+      inbound: { run: vi.fn(async () => undefined) },
       text: { chunkMarkdownText: vi.fn(() => []) },
     },
     tts: { textToSpeech: vi.fn() },
@@ -80,13 +80,13 @@ function buildAllowAccess(): QQBotInboundAccess {
 }
 
 function buildDeps(
-  cfg: unknown,
+  cfg: StubCfg,
   runtime: GatewayPluginRuntime,
   account: GatewayAccount,
 ): InboundPipelineDeps {
   return {
     account,
-    cfg,
+    cfg: cfg as InboundPipelineDeps["cfg"],
     runtime,
     startTyping: vi.fn(),
     adapters: {

@@ -1,18 +1,26 @@
+// Plugin runtime mock helpers build minimal runtime doubles for plugin SDK tests.
 import { vi } from "vitest";
 import {
-  implicitMentionKindWhen,
-  resolveInboundMentionDecision,
-} from "../channel-mention-gating.js";
+  normalizeInboundTextNewlines,
+  sanitizeInboundSystemTags,
+} from "../../auto-reply/reply/inbound-text.js";
 import {
   createAckReactionHandle,
   removeAckReactionAfterReply,
   removeAckReactionHandleAfterReply,
   shouldAckReaction,
-} from "../testing.js";
-import type { PluginRuntime } from "../testing.js";
+} from "../../channels/ack-reactions.js";
+import { createChannelReplyPipeline } from "../../channels/message/reply-pipeline.js";
+import { resolveSessionEntryResetFreshness } from "../../config/sessions/entry-freshness.js";
+import { createChannelRuntimeContextRegistry } from "../../plugins/runtime/channel-runtime-contexts.js";
+import type { PluginRuntime } from "../../plugins/runtime/types.js";
+import {
+  implicitMentionKindWhen,
+  resolveInboundMentionDecision,
+} from "../channel-mention-gating.js";
 
 const DEFAULT_PROVIDER = "openai";
-const DEFAULT_MODEL = "gpt-5.5";
+const DEFAULT_MODEL = "gpt-5.6-sol";
 
 type DeepPartial<T> = {
   [K in keyof T]?: T[K] extends (...args: never[]) => unknown
@@ -23,6 +31,12 @@ type DeepPartial<T> = {
         ? DeepPartial<T[K]>
         : T[K];
 };
+
+type BuildContextParams = Parameters<PluginRuntime["channel"]["inbound"]["buildContext"]>[0];
+type BuildContextResult = ReturnType<PluginRuntime["channel"]["inbound"]["buildContext"]>;
+type UntrustedStructuredContextEntries = NonNullable<
+  Awaited<BuildContextResult>["UntrustedStructuredContext"]
+>;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -48,6 +62,7 @@ function createTaskFlowSessionMock() {
   return {
     sessionKey: "agent:main:main",
     createManaged: vi.fn(),
+    tryCreateManaged: vi.fn(),
     get: vi.fn(),
     list: vi.fn(() => []),
     findLatest: vi.fn(),
@@ -67,6 +82,38 @@ function createDeprecatedRuntimeConfigError(name: "loadConfig" | "writeConfigFil
   return new Error(
     `Plugin runtime config.${name}() is deprecated in tests; pass cfg/current() or use mutateConfigFile()/replaceConfigFile().`,
   );
+}
+
+function normalizeUntrustedGroupPrompt(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = sanitizeInboundSystemTags(normalizeInboundTextNewlines(value));
+  return normalized.trim().length > 0 ? normalized : undefined;
+}
+
+function resolveMockUntrustedStructuredContext(
+  params: Pick<BuildContextParams, "extra" | "supplemental">,
+): UntrustedStructuredContextEntries | undefined {
+  const entries: UntrustedStructuredContextEntries = [];
+  const extraEntries = params.extra?.UntrustedStructuredContext;
+  if (Array.isArray(extraEntries)) {
+    entries.push(...(extraEntries as UntrustedStructuredContextEntries));
+  }
+  entries.push(...(params.supplemental?.untrustedContext ?? []));
+
+  const groupPrompt = normalizeUntrustedGroupPrompt(
+    params.supplemental?.untrustedGroupSystemPrompt,
+  );
+  if (groupPrompt) {
+    entries.push({
+      label: "Group prompt context",
+      type: "group_prompt_context",
+      payload: { text: groupPrompt },
+    });
+  }
+
+  return entries.length > 0 ? entries : undefined;
 }
 
 export type PluginRuntimeMediaMock = PluginRuntime["channel"]["media"];
@@ -97,6 +144,11 @@ export function createPluginRuntimeMediaMock(
 }
 
 export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = {}): PluginRuntime {
+  const runtimeContexts = createChannelRuntimeContextRegistry();
+  const runEmbeddedAgentMock = vi.fn().mockResolvedValue({
+    payloads: [],
+    meta: {},
+  }) as unknown as PluginRuntime["agent"]["runEmbeddedAgent"];
   const taskFlow = {
     bindSession: vi.fn(
       createTaskFlowSessionMock,
@@ -108,10 +160,10 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
   const dispatchAssembledChannelTurnMock = vi.fn(async (params: Record<string, unknown>) => {
     const ctxPayload = params.ctxPayload as Record<string, unknown>;
     const record = params.record as
-      | Parameters<PluginRuntime["channel"]["turn"]["runPrepared"]>[0]["record"]
+      | Parameters<PluginRuntime["channel"]["inbound"]["runPreparedReply"]>[0]["record"]
       | undefined;
     const recordInboundSession = params.recordInboundSession as Parameters<
-      PluginRuntime["channel"]["turn"]["runPrepared"]
+      PluginRuntime["channel"]["inbound"]["runPreparedReply"]
     >[0]["recordInboundSession"];
     const routeSessionKey = params.routeSessionKey as string;
     const storePath = params.storePath as string;
@@ -132,6 +184,19 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
         replyOptions?: unknown;
         replyResolver?: unknown;
       }) => Promise<unknown>;
+    const pipeline = params.replyPipeline
+      ? createChannelReplyPipeline({
+          ...(params.replyPipeline as Omit<
+            Parameters<typeof createChannelReplyPipeline>[0],
+            "cfg" | "agentId" | "channel" | "accountId"
+          >),
+          cfg: params.cfg as Parameters<typeof createChannelReplyPipeline>[0]["cfg"],
+          agentId: params.agentId as string,
+          channel: params.channel as string,
+          accountId: params.accountId as string | undefined,
+        })
+      : undefined;
+    const { onModelSelected, ...dispatcherPipeline } = pipeline ?? {};
     await recordInboundSession({
       storePath,
       sessionKey,
@@ -142,17 +207,22 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
       onRecordError: record?.onRecordError ?? (() => undefined),
       trackSessionMetaTask: record?.trackSessionMetaTask,
     });
+    await (params.afterRecord as (() => void | Promise<void>) | undefined)?.();
     const dispatchResult = await dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: params.cfg,
       dispatcherOptions: {
+        ...dispatcherPipeline,
         ...(params.dispatcherOptions as Record<string, unknown> | undefined),
         deliver: async (payload, info) => {
           await delivery.deliver(payload, info);
         },
         onError: delivery.onError,
       },
-      replyOptions: params.replyOptions,
+      replyOptions: {
+        ...(onModelSelected ? { onModelSelected } : {}),
+        ...(params.replyOptions as Record<string, unknown> | undefined),
+      },
       replyResolver: params.replyResolver,
     });
     return {
@@ -164,7 +234,7 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
     };
   });
   const runPreparedChannelTurnMock = vi.fn(
-    async (params: Parameters<PluginRuntime["channel"]["turn"]["runPrepared"]>[0]) => {
+    async (params: Parameters<PluginRuntime["channel"]["inbound"]["runPreparedReply"]>[0]) => {
       try {
         await params.recordInboundSession({
           storePath: params.storePath,
@@ -176,6 +246,7 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
           onRecordError: params.record?.onRecordError ?? (() => undefined),
           trackSessionMetaTask: params.record?.trackSessionMetaTask,
         });
+        await params.afterRecord?.();
       } catch (err) {
         try {
           await params.onPreDispatchFailure?.(err);
@@ -200,9 +271,27 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
         dispatchResult,
       };
     },
-  ) as unknown as PluginRuntime["channel"]["turn"]["runPrepared"];
+  ) as unknown as PluginRuntime["channel"]["inbound"]["runPreparedReply"];
+  const dispatchChannelTurnPlanMock = vi.fn(
+    async (params: Parameters<PluginRuntime["channel"]["inbound"]["dispatch"]>[0]) => {
+      if (!mergedRuntime) {
+        throw new Error("plugin runtime mock dispatch used before initialization");
+      }
+      return await dispatchAssembledChannelTurnMock({
+        ...params,
+        agentId: params.route.agentId,
+        routeSessionKey: params.route.sessionKey,
+        storePath: mergedRuntime.channel.session.resolveStorePath(params.cfg.session?.store, {
+          agentId: params.route.agentId,
+        }),
+        recordInboundSession: mergedRuntime.channel.session.recordInboundSession,
+        dispatchReplyWithBufferedBlockDispatcher:
+          mergedRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher,
+      });
+    },
+  ) as unknown as PluginRuntime["channel"]["inbound"]["dispatch"];
   const runChannelTurnMock = vi.fn(
-    async (params: Parameters<PluginRuntime["channel"]["turn"]["run"]>[0]) => {
+    async (params: Parameters<PluginRuntime["channel"]["inbound"]["run"]>[0]) => {
       const input = await params.adapter.ingest(params.raw);
       if (!input) {
         return {
@@ -236,21 +325,47 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
         };
       }
       const resolved = await params.adapter.resolveTurn(input, eventClass, preflight ?? {});
+      const assembled =
+        "route" in resolved
+          ? (() => {
+              if (!mergedRuntime) {
+                throw new Error("plugin runtime mock turn used before initialization");
+              }
+              const { cfg, route, ...turn } = resolved;
+              const routedTurn = {
+                ...turn,
+                routeSessionKey: route.sessionKey,
+                storePath: mergedRuntime.channel.session.resolveStorePath(cfg.session?.store, {
+                  agentId: route.agentId,
+                }),
+                recordInboundSession: mergedRuntime.channel.session.recordInboundSession,
+              };
+              return "runDispatch" in resolved
+                ? routedTurn
+                : {
+                    ...routedTurn,
+                    cfg,
+                    agentId: route.agentId,
+                    dispatchReplyWithBufferedBlockDispatcher:
+                      mergedRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher,
+                  };
+            })()
+          : resolved;
       const admission =
-        resolved.admission ?? preflight.admission ?? ({ kind: "dispatch" } as const);
+        assembled.admission ?? preflight.admission ?? ({ kind: "dispatch" } as const);
       const dispatchResult =
-        "runDispatch" in resolved
+        "runDispatch" in assembled
           ? await runPreparedChannelTurnMock({
-              ...resolved,
+              ...assembled,
               admission,
-            })
+            } as unknown as Parameters<PluginRuntime["channel"]["inbound"]["runPreparedReply"]>[0])
           : await dispatchAssembledChannelTurnMock({
-              ...resolved,
+              ...assembled,
               admission,
               delivery:
                 admission.kind === "observeOnly"
                   ? { deliver: async () => ({ visibleReplySent: false }) }
-                  : resolved.delivery,
+                  : assembled.delivery,
             });
       const result = {
         ...dispatchResult,
@@ -259,48 +374,63 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
       await params.adapter.onFinalize?.(result);
       return result;
     },
-  ) as unknown as PluginRuntime["channel"]["turn"]["run"];
-  const buildChannelInboundEventContextMock = vi.fn(
-    (params: Parameters<PluginRuntime["channel"]["turn"]["buildContext"]>[0]) =>
-      ({
-        Body: params.message.body ?? params.message.rawBody,
-        BodyForAgent: params.message.bodyForAgent ?? params.message.rawBody,
-        RawBody: params.message.rawBody,
-        CommandBody: params.message.commandBody ?? params.message.rawBody,
-        BodyForCommands: params.message.commandBody ?? params.message.rawBody,
-        From: params.from,
-        To: params.reply.to,
-        SessionKey: params.route.dispatchSessionKey ?? params.route.routeSessionKey,
-        AccountId: params.route.accountId ?? params.accountId,
-        MessageSid: params.messageId,
-        MessageSidFull: params.messageIdFull,
-        ReplyToId: params.reply.replyToId ?? params.supplemental?.quote?.id,
-        ReplyToIdFull: params.reply.replyToIdFull ?? params.supplemental?.quote?.fullId,
-        MediaPath: params.media?.[0]?.path,
-        MediaUrl: params.media?.[0]?.url ?? params.media?.[0]?.path,
-        MediaType: params.media?.[0]?.contentType ?? params.media?.[0]?.kind,
-        ChatType: params.conversation.kind,
-        ConversationLabel: params.conversation.label,
-        SenderName: params.sender.name ?? params.sender.displayLabel,
-        SenderId: params.sender.id,
-        SenderUsername: params.sender.username,
-        Timestamp: params.timestamp,
-        WasMentioned: params.access?.mentions?.wasMentioned,
-        GroupSystemPrompt: params.supplemental?.groupSystemPrompt,
-        Provider: params.provider ?? params.channel,
-        Surface: params.surface ?? params.provider ?? params.channel,
-        OriginatingChannel: params.channel,
-        OriginatingTo: params.reply.originatingTo,
-        CommandAuthorized: params.access?.commands
-          ? (params.access.commands.authorized ??
-            params.access.commands.authorizers?.some((entry) => entry.allowed) ??
-            false)
-          : false,
-        ...params.extra,
-      }) as ReturnType<PluginRuntime["channel"]["turn"]["buildContext"]>,
-  ) as unknown as PluginRuntime["channel"]["turn"]["buildContext"];
+  ) as unknown as PluginRuntime["channel"]["inbound"]["run"];
+  const buildChannelInboundEventContextMock = vi.fn((params: BuildContextParams) => {
+    const untrustedStructuredContext = resolveMockUntrustedStructuredContext(params);
+    return {
+      Body: params.message.body ?? params.message.rawBody,
+      BodyForAgent: params.message.bodyForAgent ?? params.message.rawBody,
+      RawBody: params.message.rawBody,
+      CommandBody: params.message.commandBody ?? params.message.rawBody,
+      BodyForCommands: params.message.commandBody ?? params.message.rawBody,
+      From: params.from,
+      To: params.reply.to,
+      SessionKey: params.route.dispatchSessionKey ?? params.route.routeSessionKey,
+      AccountId: params.route.accountId ?? params.accountId,
+      MessageSid: params.messageId,
+      MessageSidFull: params.messageIdFull,
+      ReplyToId: params.reply.replyToId ?? params.supplemental?.quote?.id,
+      ReplyToIdFull: params.reply.replyToIdFull ?? params.supplemental?.quote?.fullId,
+      MediaPath: params.media?.[0]?.path,
+      MediaUrl: params.media?.[0]?.url ?? params.media?.[0]?.path,
+      MediaType: params.media?.[0]?.contentType ?? params.media?.[0]?.kind,
+      ChatType: params.conversation.kind,
+      ConversationLabel: params.conversation.label,
+      SenderName: params.sender.name ?? params.sender.displayLabel,
+      SenderId: params.sender.id,
+      SenderUsername: params.sender.username,
+      Timestamp: params.timestamp,
+      WasMentioned: params.access?.mentions?.wasMentioned,
+      GroupSystemPrompt: params.supplemental?.groupSystemPrompt,
+      Provider: params.provider ?? params.channel,
+      Surface: params.surface ?? params.provider ?? params.channel,
+      OriginatingChannel: params.channel,
+      OriginatingTo: params.reply.originatingTo,
+      CommandAuthorized: params.access?.commands?.authorized ?? false,
+      ...params.extra,
+      UntrustedStructuredContext: untrustedStructuredContext,
+    } as Awaited<BuildContextResult>;
+  }) as unknown as PluginRuntime["channel"]["inbound"]["buildContext"];
+  const sessionRuntime = {
+    resolveStorePath: vi.fn(
+      () => "/tmp/sessions.json",
+    ) as unknown as PluginRuntime["channel"]["session"]["resolveStorePath"],
+    readSessionUpdatedAt: vi.fn(
+      () => undefined,
+    ) as unknown as PluginRuntime["channel"]["session"]["readSessionUpdatedAt"],
+    recordSessionMetaFromInbound:
+      vi.fn() as unknown as PluginRuntime["channel"]["session"]["recordSessionMetaFromInbound"],
+    recordInboundSession:
+      vi.fn() as unknown as PluginRuntime["channel"]["session"]["recordInboundSession"],
+    updateLastRoute: vi.fn() as unknown as PluginRuntime["channel"]["session"]["updateLastRoute"],
+    resolveEntryResetFreshness: vi.fn(resolveSessionEntryResetFreshness),
+  };
   const base: PluginRuntime = {
     version: "1.0.0-test",
+    gateway: {
+      isAvailable: vi.fn(async () => false),
+      request: vi.fn(),
+    },
     config: {
       current: vi.fn(() => ({})) as unknown as PluginRuntime["config"]["current"],
       mutateConfigFile: vi.fn(async () => ({
@@ -346,6 +476,9 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
       resolveThinkingDefault: vi.fn(
         () => "off",
       ) as unknown as PluginRuntime["agent"]["resolveThinkingDefault"],
+      resolveCliBackendDispatchEligibility: vi.fn(
+        () => undefined,
+      ) as unknown as PluginRuntime["agent"]["resolveCliBackendDispatchEligibility"],
       normalizeThinkingLevel: vi.fn(
         (raw?: string | null) => raw,
       ) as unknown as PluginRuntime["agent"]["normalizeThinkingLevel"],
@@ -358,14 +491,8 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
           { id: "high", label: "high" },
         ],
       })) as unknown as PluginRuntime["agent"]["resolveThinkingPolicy"],
-      runEmbeddedPiAgent: vi.fn().mockResolvedValue({
-        payloads: [],
-        meta: {},
-      }) as unknown as PluginRuntime["agent"]["runEmbeddedPiAgent"],
-      runEmbeddedAgent: vi.fn().mockResolvedValue({
-        payloads: [],
-        meta: {},
-      }) as unknown as PluginRuntime["agent"]["runEmbeddedAgent"],
+      runEmbeddedAgent: runEmbeddedAgentMock,
+      runEmbeddedPiAgent: runEmbeddedAgentMock,
       resolveAgentTimeoutMs: vi.fn(
         () => 30_000,
       ) as unknown as PluginRuntime["agent"]["resolveAgentTimeoutMs"],
@@ -376,27 +503,74 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
         resolveStorePath: vi.fn(
           () => "/tmp/agent-sessions.json",
         ) as unknown as PluginRuntime["agent"]["session"]["resolveStorePath"],
-        loadSessionStore: vi.fn(
-          () => ({}),
-        ) as unknown as PluginRuntime["agent"]["session"]["loadSessionStore"],
-        saveSessionStore: vi
+        createSessionEntry: vi.fn(
+          async (
+            params: Parameters<PluginRuntime["agent"]["session"]["createSessionEntry"]>[0],
+          ) => {
+            const sessionId = "plugin-runtime-mock-session";
+            const key = params.key;
+            const initialEntry = {
+              sessionId,
+              updatedAt: Date.now(),
+              ...(params.label !== undefined ? { label: params.label } : {}),
+              ...(params.spawnedCwd !== undefined ? { spawnedCwd: params.spawnedCwd } : {}),
+              ...structuredClone(params.initialEntry),
+              ...(params.afterCreate ? { initializationPending: true as const } : {}),
+            };
+            const initialized = {
+              key,
+              agentId: params.agentId ?? "main",
+              sessionId,
+              entry: initialEntry,
+            };
+            const finalPatch = await params.afterCreate?.(structuredClone(initialized));
+            if (finalPatch !== undefined) {
+              const patchKeys = Object.keys(finalPatch);
+              if (patchKeys.length !== 1 || patchKeys[0] !== "pluginExtensions") {
+                throw new Error("session creation final patch may only contain pluginExtensions");
+              }
+            }
+            return {
+              ...initialized,
+              entry:
+                params.afterCreate === undefined
+                  ? initialEntry
+                  : {
+                      ...initialEntry,
+                      ...(finalPatch === undefined
+                        ? {}
+                        : {
+                            pluginExtensions: structuredClone(finalPatch.pluginExtensions),
+                          }),
+                      initializationPending: undefined,
+                    },
+            };
+          },
+        ) as PluginRuntime["agent"]["session"]["createSessionEntry"],
+        getSessionEntry: vi.fn(
+          () => undefined,
+        ) as unknown as PluginRuntime["agent"]["session"]["getSessionEntry"],
+        listSessionEntries: vi.fn(
+          () => [],
+        ) as unknown as PluginRuntime["agent"]["session"]["listSessionEntries"],
+        patchSessionEntry: vi
+          .fn()
+          .mockResolvedValue(
+            null,
+          ) as unknown as PluginRuntime["agent"]["session"]["patchSessionEntry"],
+        upsertSessionEntry: vi
           .fn()
           .mockResolvedValue(
             undefined,
-          ) as unknown as PluginRuntime["agent"]["session"]["saveSessionStore"],
-        updateSessionStore: vi
-          .fn()
-          .mockResolvedValue(
-            undefined,
-          ) as unknown as PluginRuntime["agent"]["session"]["updateSessionStore"],
+          ) as unknown as PluginRuntime["agent"]["session"]["upsertSessionEntry"],
+        runWithWorkAdmission: vi.fn(
+          async (_params, run) => await run(new AbortController().signal),
+        ) as PluginRuntime["agent"]["session"]["runWithWorkAdmission"],
         updateSessionStoreEntry: vi
           .fn()
           .mockResolvedValue(
             null,
           ) as unknown as PluginRuntime["agent"]["session"]["updateSessionStoreEntry"],
-        resolveSessionFilePath: vi.fn(
-          (sessionId: string) => `/tmp/${sessionId}.json`,
-        ) as unknown as PluginRuntime["agent"]["session"]["resolveSessionFilePath"],
       },
     },
     system: {
@@ -422,6 +596,7 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
       resizeToJpeg: vi.fn() as unknown as PluginRuntime["media"]["resizeToJpeg"],
     },
     tts: {
+      prepareTtsRequest: vi.fn() as unknown as PluginRuntime["tts"]["prepareTtsRequest"],
       textToSpeech: vi.fn() as unknown as PluginRuntime["tts"]["textToSpeech"],
       textToSpeechStream: vi.fn() as unknown as PluginRuntime["tts"]["textToSpeechStream"],
       textToSpeechTelephony: vi.fn() as unknown as PluginRuntime["tts"]["textToSpeechTelephony"],
@@ -548,26 +723,17 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
           .mockResolvedValue(
             [],
           ) as unknown as PluginRuntime["channel"]["pairing"]["readAllowFromStore"],
+        removeAllowFromStoreEntry: vi.fn().mockResolvedValue({
+          changed: false,
+          allowFrom: [],
+        }) as unknown as PluginRuntime["channel"]["pairing"]["removeAllowFromStoreEntry"],
         upsertPairingRequest: vi.fn().mockResolvedValue({
           code: "TESTCODE",
           created: true,
         }) as unknown as PluginRuntime["channel"]["pairing"]["upsertPairingRequest"],
       },
       media: createPluginRuntimeMediaMock(),
-      session: {
-        resolveStorePath: vi.fn(
-          () => "/tmp/sessions.json",
-        ) as unknown as PluginRuntime["channel"]["session"]["resolveStorePath"],
-        readSessionUpdatedAt: vi.fn(
-          () => undefined,
-        ) as unknown as PluginRuntime["channel"]["session"]["readSessionUpdatedAt"],
-        recordSessionMetaFromInbound:
-          vi.fn() as unknown as PluginRuntime["channel"]["session"]["recordSessionMetaFromInbound"],
-        recordInboundSession:
-          vi.fn() as unknown as PluginRuntime["channel"]["session"]["recordInboundSession"],
-        updateLastRoute:
-          vi.fn() as unknown as PluginRuntime["channel"]["session"]["updateLastRoute"],
-      },
+      session: sessionRuntime,
       mentions: {
         buildMentionRegexes: vi.fn(() => [
           /\bbert\b/i,
@@ -661,28 +827,13 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
       outbound: {
         loadAdapter: vi.fn() as unknown as PluginRuntime["channel"]["outbound"]["loadAdapter"],
       },
-      turn: {
+      inbound: {
         run: runChannelTurnMock,
-        runAssembled:
-          dispatchAssembledChannelTurnMock as unknown as PluginRuntime["channel"]["turn"]["runAssembled"],
-        runResolved: vi.fn(
-          async (params: Parameters<PluginRuntime["channel"]["turn"]["runResolved"]>[0]) =>
-            await runChannelTurnMock({
-              channel: params.channel,
-              accountId: params.accountId,
-              raw: params.raw,
-              log: params.log,
-              adapter: {
-                ingest: (raw) =>
-                  typeof params.input === "function" ? params.input(raw) : params.input,
-                resolveTurn: params.resolveTurn,
-              },
-            }),
-        ) as unknown as PluginRuntime["channel"]["turn"]["runResolved"],
+        dispatch: dispatchChannelTurnPlanMock,
+        dispatchReply:
+          dispatchAssembledChannelTurnMock as unknown as PluginRuntime["channel"]["inbound"]["dispatchReply"],
         buildContext: buildChannelInboundEventContextMock,
-        runPrepared: runPreparedChannelTurnMock,
-        dispatchAssembled:
-          dispatchAssembledChannelTurnMock as unknown as PluginRuntime["channel"]["turn"]["dispatchAssembled"],
+        runPreparedReply: runPreparedChannelTurnMock,
       },
       threadBindings: {
         setIdleTimeoutBySessionKey:
@@ -691,17 +842,20 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
           vi.fn() as unknown as PluginRuntime["channel"]["threadBindings"]["setMaxAgeBySessionKey"],
       },
       runtimeContexts: {
-        register: vi.fn(({ abortSignal }: { abortSignal?: AbortSignal }) => {
-          const lease = { dispose: vi.fn() };
-          abortSignal?.addEventListener("abort", lease.dispose, { once: true });
-          return lease;
-        }) as unknown as PluginRuntime["channel"]["runtimeContexts"]["register"],
-        get: vi.fn() as unknown as PluginRuntime["channel"]["runtimeContexts"]["get"],
-        watch: vi.fn(() =>
-          vi.fn(),
+        register: vi.fn(
+          runtimeContexts.register,
+        ) as unknown as PluginRuntime["channel"]["runtimeContexts"]["register"],
+        get: vi.fn(
+          runtimeContexts.get,
+        ) as unknown as PluginRuntime["channel"]["runtimeContexts"]["get"],
+        watch: vi.fn(
+          runtimeContexts.watch,
         ) as unknown as PluginRuntime["channel"]["runtimeContexts"]["watch"],
       },
-      activity: {} as PluginRuntime["channel"]["activity"],
+      activity: {
+        record: vi.fn(),
+        get: vi.fn(() => ({ inboundAt: null, outboundAt: null })),
+      },
     },
     events: {
       onAgentEvent: vi.fn(() => () => {}) as unknown as PluginRuntime["events"]["onAgentEvent"],
@@ -720,9 +874,25 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
     },
     state: {
       resolveStateDir: vi.fn(() => "/tmp/openclaw"),
+      openBlobStore: vi.fn(() => {
+        throw new Error("openBlobStore mock is not configured");
+      }) as unknown as PluginRuntime["state"]["openBlobStore"],
       openKeyedStore: vi.fn(() => {
         throw new Error("openKeyedStore mock is not configured");
       }) as unknown as PluginRuntime["state"]["openKeyedStore"],
+      openSyncKeyedStore: vi.fn(() => {
+        throw new Error("openSyncKeyedStore mock is not configured");
+      }) as unknown as PluginRuntime["state"]["openSyncKeyedStore"],
+      withLease: vi.fn(
+        async (_options, run) =>
+          await run({ signal: new AbortController().signal, assertOwned: vi.fn() }),
+      ),
+      openChannelIngressQueue: vi.fn(() => {
+        throw new Error("openChannelIngressQueue mock is not configured");
+      }) as unknown as PluginRuntime["state"]["openChannelIngressQueue"],
+      openChannelIngressDrain: vi.fn(() => {
+        throw new Error("openChannelIngressDrain mock is not configured");
+      }) as unknown as PluginRuntime["state"]["openChannelIngressDrain"],
     },
     tasks: {
       runs: {
@@ -751,7 +921,19 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
       getSession: vi.fn(),
       deleteSession: vi.fn(),
     },
+    sandbox: {
+      resolveWorkspaceAuthority: vi.fn(),
+      prepareWorkspaceAuthority: vi.fn(),
+    },
+    worktrees: {
+      resolveCheckoutRoot: vi.fn(),
+      hasSelfContainedCheckoutMetadata: vi.fn(),
+      create: vi.fn(),
+      release: vi.fn(),
+      removeIfLossless: vi.fn(),
+    },
     llm: {
+      acquireLocalService: vi.fn(),
       complete: vi.fn(),
     },
     nodes: {
@@ -760,5 +942,7 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
     },
   };
 
-  return mergeDeep(base, overrides);
+  const mergedRuntime = mergeDeep(base, overrides);
+  return mergedRuntime;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

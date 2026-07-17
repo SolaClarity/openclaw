@@ -1,15 +1,16 @@
+// Discord provider module implements model/runtime integration.
 import { CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY } from "openclaw/plugin-sdk/approval-handler-adapter-runtime";
 import type { ChannelRuntimeSurface } from "openclaw/plugin-sdk/channel-contract";
 import { registerChannelRuntimeContext } from "openclaw/plugin-sdk/channel-runtime-context";
 import type { NativeCommandSpec } from "openclaw/plugin-sdk/command-auth-native";
 import type { DiscordAccountConfig, OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
-import { isDiscordExecApprovalClientEnabled } from "../exec-approvals.js";
+import { createDiscordActivityButton } from "../activities/interaction.js";
 import {
-  type BaseCommand,
-  type BaseMessageInteractiveComponent,
-  type Modal,
-} from "../internal/discord.js";
+  getDiscordExecApprovalApprovers,
+  isDiscordExecApprovalClientEnabled,
+} from "../exec-approvals.js";
+import type { BaseCommand, BaseMessageInteractiveComponent, Modal } from "../internal/discord.js";
 import { createDiscordVoiceCommand } from "../voice/command.js";
 import {
   createAgentComponentControls,
@@ -34,6 +35,7 @@ export function createDiscordProviderInteractionSurface(params: {
   cfg: OpenClawConfig;
   discordConfig: DiscordAccountConfig;
   accountId: string;
+  applicationId?: string;
   token: string;
   commandSpecs: NativeCommandSpec[];
   nativeEnabled: boolean;
@@ -88,6 +90,12 @@ export function createDiscordProviderInteractionSurface(params: {
     accountId: params.accountId,
     configOverride: execApprovalsConfig,
   });
+  const approvalActionsEnabled =
+    getDiscordExecApprovalApprovers({
+      cfg: params.cfg,
+      accountId: params.accountId,
+      configOverride: execApprovalsConfig,
+    }).length > 0;
   if (execApprovalsEnabled) {
     registerChannelRuntimeContext({
       channelRuntime: params.channelRuntime,
@@ -125,9 +133,25 @@ export function createDiscordProviderInteractionSurface(params: {
       threadBindings: params.threadBindings,
     }),
   ];
+  const activityButton = createDiscordActivityButton(
+    {
+      cfg: params.cfg,
+      discordConfig: params.discordConfig,
+      accountId: params.accountId,
+      guildEntries: params.guildEntries,
+      allowFrom: params.allowFrom,
+      dmPolicy: params.dmPolicy,
+      runtime: params.runtime,
+      token: params.token,
+    },
+    params.applicationId,
+  );
+  if (activityButton) {
+    components.push(activityButton);
+  }
   const modals: Modal[] = [];
 
-  if (execApprovalsEnabled) {
+  if (approvalActionsEnabled) {
     components.push(
       createExecApprovalButton(
         createDiscordExecApprovalButtonContext({

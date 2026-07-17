@@ -1,3 +1,5 @@
+// Music background tests cover task-run creation, progress recording, and
+// completion delivery through the durable requester-agent handoff.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MUSIC_GENERATION_TASK_KIND } from "../music-generation-task-status.js";
 import {
@@ -17,11 +19,13 @@ vi.mock("../subagent-announce-delivery.js", () => announceDeliveryMocks);
 
 const {
   createMusicGenerationTaskRun,
+  musicGenerationTaskLifecycle,
   recordMusicGenerationTaskProgress,
-  wakeMusicGenerationTaskCompletion,
 } = await import("./music-generate-background.js");
 
 function getDeliveredInternalEvents(): Array<Record<string, unknown>> {
+  // Completion agents receive internal events; tests inspect them to keep the
+  // visible-reply media contract explicit.
   const params = announceDeliveryMocks.deliverSubagentAnnouncement.mock.calls.at(0)?.[0] as
     | { internalEvents?: unknown }
     | undefined;
@@ -102,7 +106,7 @@ describe("music generate background helpers", () => {
       path: "direct",
     });
 
-    await wakeMusicGenerationTaskCompletion({
+    await musicGenerationTaskLifecycle.wakeTaskCompletion({
       ...createMediaCompletionFixture({
         runId: "tool:music_generate:abc",
         taskLabel: "night-drive synthwave",
@@ -115,7 +119,7 @@ describe("music generate background helpers", () => {
     expect(announceDeliveryMocks.deliverSubagentAnnouncement).toHaveBeenCalledTimes(1);
   });
 
-  it("warns channel completion agents that normal final replies are private", async () => {
+  it("tells channel completion agents to follow the visible-reply contract", async () => {
     announceDeliveryMocks.deliverSubagentAnnouncement.mockResolvedValue({
       delivered: true,
       path: "direct",
@@ -127,7 +131,7 @@ describe("music generate background helpers", () => {
       mediaUrls: ["/tmp/generated-night-drive.mp3"],
     });
 
-    await wakeMusicGenerationTaskCompletion({
+    await musicGenerationTaskLifecycle.wakeTaskCompletion({
       ...completion,
       handle: {
         ...completion.handle,
@@ -135,15 +139,16 @@ describe("music generate background helpers", () => {
       },
     });
 
-    expectReplyInstructionContains("the user will NOT see your normal assistant final reply");
-    expectReplyInstructionContains("the media must be sent as message-tool attachments");
+    expectReplyInstructionContains("visible-reply contract");
+    expectReplyInstructionContains("final-reply MEDIA lines");
   });
 
-  it("delivers failure completion notices directly", async () => {
+  it("keeps failed completion notices in the durable agent-loop handoff", async () => {
     announceDeliveryMocks.deliverSubagentAnnouncement.mockResolvedValue({
       delivered: false,
       path: "direct",
-      error: "completion agent did not deliver through the message tool",
+      reason: "generated_media_missing",
+      error: "completion agent did not deliver generated media",
     });
     const completion = createMediaCompletionFixture({
       runId: "tool:music_generate:abc",
@@ -151,18 +156,15 @@ describe("music generate background helpers", () => {
       result: "provider failed",
     });
 
-    await wakeMusicGenerationTaskCompletion({
-      ...completion,
-      status: "error",
-      statusLabel: "failed",
-    });
-
-    expect(taskDeliveryRuntimeMocks.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        content: "Music generation failed: provider failed",
-        idempotencyKey: "music_generate:task-123:error:direct",
+    await expect(
+      musicGenerationTaskLifecycle.wakeTaskCompletion({
+        ...completion,
+        status: "error",
+        statusLabel: "failed",
       }),
-    );
+    ).resolves.toEqual({ status: "permanent_failure" });
+
+    expect(taskDeliveryRuntimeMocks.sendMessage).not.toHaveBeenCalled();
     expect(announceDeliveryMocks.deliverSubagentAnnouncement).toHaveBeenCalledTimes(1);
   });
 
@@ -180,7 +182,7 @@ describe("music generate background helpers", () => {
         mediaUrls: ["/tmp/generated-night-drive.mp3"],
       });
 
-      await wakeMusicGenerationTaskCompletion({
+      await musicGenerationTaskLifecycle.wakeTaskCompletion({
         ...completion,
         handle: {
           ...completion.handle,
@@ -188,8 +190,8 @@ describe("music generate background helpers", () => {
         },
       });
 
-      expectReplyInstructionContains("the user will NOT see your normal assistant final reply");
-      expectReplyInstructionContains("the media must be sent as message-tool attachments");
+      expectReplyInstructionContains("visible-reply contract");
+      expectReplyInstructionContains("final-reply MEDIA lines");
     },
   );
 
@@ -203,7 +205,7 @@ describe("music generate background helpers", () => {
       path: "direct",
     });
 
-    await wakeMusicGenerationTaskCompletion({
+    await musicGenerationTaskLifecycle.wakeTaskCompletion({
       ...createMediaCompletionFixture({
         directSend: true,
         runId: "tool:music_generate:abc",

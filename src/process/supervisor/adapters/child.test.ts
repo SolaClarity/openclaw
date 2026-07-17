@@ -1,16 +1,21 @@
+// Child adapter tests cover adapting child processes to supervisor runs.
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../../../test/helpers/temp-dir.js";
 import {
   expectRealExitWinsOverSigkillFallback,
   expectWaitStaysPendingUntilSigkillFallback,
 } from "./test-support.js";
 
-const { spawnWithFallbackMock, killProcessTreeMock, createWindowsOutputDecoderMock } = vi.hoisted(
+const { spawnWithFallbackMock, signalProcessTreeMock, createWindowsOutputDecoderMock } = vi.hoisted(
   () => ({
     spawnWithFallbackMock: vi.fn(),
-    killProcessTreeMock: vi.fn(),
+    signalProcessTreeMock: vi.fn(),
     createWindowsOutputDecoderMock: vi.fn(() => ({
       decode: (chunk: Buffer | string) => (Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk),
       flush: () => "",
@@ -23,7 +28,7 @@ vi.mock("../../spawn-utils.js", () => ({
 }));
 
 vi.mock("../../kill-tree.js", () => ({
-  killProcessTree: killProcessTreeMock,
+  signalProcessTree: signalProcessTreeMock,
 }));
 
 vi.mock("../../../infra/windows-encoding.js", () => ({
@@ -31,6 +36,8 @@ vi.mock("../../../infra/windows-encoding.js", () => ({
 }));
 
 let createChildAdapter: typeof import("./child.js").createChildAdapter;
+let getWindowsInstallRoots: typeof import("../../../infra/windows-install-roots.js").getWindowsInstallRoots;
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 function createStubChild(pid = 1234) {
   const child = new EventEmitter() as ChildProcess;
@@ -82,6 +89,8 @@ type SpawnWithFallbackParams = {
     detached?: boolean;
     env?: NodeJS.ProcessEnv | Record<string, string>;
     stdio?: string[];
+    windowsHide?: boolean;
+    windowsVerbatimArguments?: boolean;
   };
   fallbacks?: Array<{ options?: { detached?: boolean } }>;
 };
@@ -106,6 +115,10 @@ function firstMockArg(mock: { mock: { calls: readonly unknown[][] } }, label: st
   return call[0];
 }
 
+function expectedTrustedCmdExe(): string {
+  return path.win32.join(getWindowsInstallRoots().systemRoot, "System32", "cmd.exe");
+}
+
 describe("createChildAdapter", () => {
   const originalServiceMarker = process.env.OPENCLAW_SERVICE_MARKER;
   const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
@@ -117,13 +130,19 @@ describe("createChildAdapter", () => {
     });
   };
 
-  beforeAll(async () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    const accessSync = fs.accessSync.bind(fs);
+    vi.spyOn(fs, "accessSync").mockImplementation((filePath, mode) => {
+      if (String(filePath).toLowerCase() === "c:\\windows\\system32\\reg.exe") {
+        throw new Error("registry lookup disabled for test");
+      }
+      return accessSync(filePath, mode);
+    });
+    ({ getWindowsInstallRoots } = await import("../../../infra/windows-install-roots.js"));
     ({ createChildAdapter } = await import("./child.js"));
-  });
-
-  beforeEach(() => {
     spawnWithFallbackMock.mockClear();
-    killProcessTreeMock.mockClear();
+    signalProcessTreeMock.mockClear();
     createWindowsOutputDecoderMock.mockClear();
     createWindowsOutputDecoderMock.mockImplementation(() => ({
       decode: (chunk: Buffer | string) => (Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk),
@@ -142,11 +161,31 @@ describe("createChildAdapter", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     if (originalPlatformDescriptor) {
       Object.defineProperty(process, "platform", originalPlatformDescriptor);
     }
     vi.useRealTimers();
   });
+
+  const createWindowsNpmShim = async (params: { command: string; packagePath: string[] }) => {
+    const binDir = tempDirs.make("openclaw-child-shim-");
+    const entrypoint = path.join(binDir, "node_modules", ...params.packagePath);
+    await mkdir(path.dirname(entrypoint), { recursive: true });
+    await writeFile(entrypoint, "", "utf8");
+    const relativeEntrypoint = path.relative(binDir, entrypoint).replaceAll(path.sep, "\\");
+    const shimHead =
+      "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n";
+    const shimCommand = entrypoint.endsWith(".exe")
+      ? `"%dp0%\\${relativeEntrypoint}" %*\r\n`
+      : `IF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n)\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%" "%dp0%\\${relativeEntrypoint}" %*\r\n`;
+    await writeFile(
+      path.join(binDir, `${params.command}.cmd`),
+      `${shimHead}${shimCommand}`,
+      "utf8",
+    );
+    return { binDir, entrypoint };
+  };
 
   it("uses process-tree kill for default SIGKILL", async () => {
     const { adapter, killMock } = await createAdapterHarness({ pid: 4321 });
@@ -164,14 +203,16 @@ describe("createChildAdapter", () => {
 
     adapter.kill();
 
-    // Detachment flag is now passed to killProcessTree so it knows whether
+    // Detachment flag is now passed to signalProcessTree so it knows whether
     // it can safely group-kill via -pid. (#71662)
     const expectedDetached = process.platform !== "win32" && !process.env.OPENCLAW_SERVICE_MARKER;
-    expect(killProcessTreeMock).toHaveBeenCalledWith(4321, { detached: expectedDetached });
+    expect(signalProcessTreeMock).toHaveBeenCalledWith(4321, "SIGKILL", {
+      detached: expectedDetached,
+    });
     expect(killMock).toHaveBeenCalledWith("SIGKILL");
   });
 
-  it("passes detached:false to killProcessTree when spawn fell back to no-detach (#71662 follow-up)", async () => {
+  it("passes detached:false to signalProcessTree when spawn fell back to no-detach (#71662 follow-up)", async () => {
     // Simulate the fallback scenario: spawnWithFallback retried with
     // detached:false because the initial detached spawn failed. The kill
     // closure must NOT group-kill since the child shares the gateway's group.
@@ -188,7 +229,7 @@ describe("createChildAdapter", () => {
 
     adapter.kill();
 
-    expect(killProcessTreeMock).toHaveBeenCalledWith(8888, { detached: false });
+    expect(signalProcessTreeMock).toHaveBeenCalledWith(8888, "SIGKILL", { detached: false });
     expect(killMock).toHaveBeenCalledWith("SIGKILL");
   });
 
@@ -197,20 +238,52 @@ describe("createChildAdapter", () => {
     try {
       const { adapter, killMock } = await createAdapterHarness({ pid: 9999 });
       adapter.kill();
-      expect(killProcessTreeMock).toHaveBeenCalledWith(9999, { detached: false });
+      expect(signalProcessTreeMock).toHaveBeenCalledWith(9999, "SIGKILL", { detached: false });
       expect(killMock).toHaveBeenCalledWith("SIGKILL");
     } finally {
       delete process.env.OPENCLAW_SERVICE_MARKER;
     }
   });
 
-  it("uses direct child.kill for non-SIGKILL signals", async () => {
+  it("uses process-tree kill for graceful SIGTERM cancellation", async () => {
     const { adapter, killMock } = await createAdapterHarness({ pid: 7654 });
 
     adapter.kill("SIGTERM");
 
-    expect(killProcessTreeMock).not.toHaveBeenCalled();
-    expect(killMock).toHaveBeenCalledWith("SIGTERM");
+    const expectedDetached = process.platform !== "win32" && !process.env.OPENCLAW_SERVICE_MARKER;
+    expect(signalProcessTreeMock).toHaveBeenCalledWith(7654, "SIGTERM", {
+      detached: expectedDetached,
+    });
+    expect(killMock).not.toHaveBeenCalled();
+  });
+
+  it("passes detached:false to process-tree SIGTERM when spawn fell back to no-detach", async () => {
+    const { child, killMock } = createStubChild(8765);
+    spawnWithFallbackMock.mockResolvedValue({
+      child,
+      usedFallback: true,
+      fallbackLabel: "no-detach",
+    });
+    const adapter = await createChildAdapter({
+      argv: ["node", "-e", "setTimeout(() => {}, 1000)"],
+      stdinMode: "pipe-open",
+    });
+
+    adapter.kill("SIGTERM");
+
+    expect(signalProcessTreeMock).toHaveBeenCalledWith(8765, "SIGTERM", {
+      detached: false,
+    });
+    expect(killMock).not.toHaveBeenCalled();
+  });
+
+  it("uses direct child.kill for non-SIGTERM and non-SIGKILL signals", async () => {
+    const { adapter, killMock } = await createAdapterHarness({ pid: 7654 });
+
+    adapter.kill("SIGINT");
+
+    expect(signalProcessTreeMock).not.toHaveBeenCalled();
+    expect(killMock).toHaveBeenCalledWith("SIGINT");
   });
 
   it("preserves inherited stdin when no input pipe is requested", async () => {
@@ -282,11 +355,11 @@ describe("createChildAdapter", () => {
         child: stub.child,
         usedFallback: false,
       });
-      const adapter = await createChildAdapter({
+      const adapterValue = await createChildAdapter({
         argv: ["node", "-e", "setTimeout(() => {}, 1000)"],
         stdinMode: "pipe-open",
       });
-      return { ...stub, adapter };
+      return { ...stub, adapter: adapterValue };
     })();
 
     await expectRealExitWinsOverSigkillFallback({
@@ -312,11 +385,11 @@ describe("createChildAdapter", () => {
         child: stub.child,
         usedFallback: false,
       });
-      const adapter = await createChildAdapter({
+      const adapterLocal = await createChildAdapter({
         argv: ["openclaw", "version"],
         stdinMode: "pipe-closed",
       });
-      return { ...stub, adapter };
+      return { ...stub, adapter: adapterLocal };
     })();
 
     const settled = vi.fn();
@@ -353,6 +426,71 @@ describe("createChildAdapter", () => {
     const spawnArgs = firstSpawnWithFallbackParams();
     expect(spawnArgs.argv).toEqual(["node", "-e", "process.exit(0)"]);
     expect(spawnArgs.options?.env).toBeUndefined();
+  });
+
+  it("wraps Windows command shims through trusted cmd.exe", async () => {
+    setPlatform("win32");
+
+    await createAdapterHarness({
+      pid: 3335,
+      argv: ["pnpm", "--version"],
+      env: { PATH: "", PATHEXT: ".EXE;.CMD;.BAT" },
+    });
+
+    const spawnArgs = firstSpawnWithFallbackParams();
+    expect(spawnArgs.argv).toEqual([
+      expectedTrustedCmdExe(),
+      "/d",
+      "/s",
+      "/c",
+      "pnpm.cmd --version",
+    ]);
+    expect(spawnArgs.options?.detached).toBe(false);
+    expect(spawnArgs.options?.windowsHide).toBe(true);
+    expect(spawnArgs.options?.windowsVerbatimArguments).toBe(true);
+    expect(spawnArgs.fallbacks).toStrictEqual([]);
+  });
+
+  it("unwraps Gemini's npm shim and preserves prompt argv on Windows", async () => {
+    setPlatform("win32");
+    const { binDir, entrypoint } = await createWindowsNpmShim({
+      command: "gemini",
+      packagePath: ["@google", "gemini-cli", "bundle", "gemini.js"],
+    });
+    const nodePath = path.join(binDir, "node.exe");
+    await writeFile(nodePath, "", "utf8");
+    const prompt = "explain A&B | C > D and 100% coverage";
+
+    await createAdapterHarness({
+      pid: 3336,
+      argv: ["gemini", "--prompt", prompt],
+      env: { PATH: binDir, PATHEXT: ".EXE;.CMD;.BAT" },
+    });
+
+    const spawnArgs = firstSpawnWithFallbackParams();
+    expect(spawnArgs.argv?.[0]?.toLowerCase()).toBe(nodePath.toLowerCase());
+    expect(spawnArgs.argv?.slice(1)).toEqual([entrypoint, "--prompt", prompt]);
+    expect(spawnArgs.options?.windowsVerbatimArguments).toBeUndefined();
+    expect(spawnArgs.fallbacks).toStrictEqual([]);
+  });
+
+  it("unwraps Claude's npm shim to its native executable on Windows", async () => {
+    setPlatform("win32");
+    const { binDir, entrypoint } = await createWindowsNpmShim({
+      command: "claude",
+      packagePath: ["@anthropic-ai", "claude-code", "bin", "claude.exe"],
+    });
+
+    await createAdapterHarness({
+      pid: 3337,
+      argv: ["claude", "--version"],
+      env: { PATH: binDir, PATHEXT: ".EXE;.CMD;.BAT" },
+    });
+
+    const spawnArgs = firstSpawnWithFallbackParams();
+    expect(spawnArgs.argv).toEqual([entrypoint, "--version"]);
+    expect(spawnArgs.options?.windowsVerbatimArguments).toBeUndefined();
+    expect(spawnArgs.fallbacks).toStrictEqual([]);
   });
 
   it("wraps Linux child spawns and strips shell-init env", async () => {
@@ -441,5 +579,43 @@ describe("createChildAdapter", () => {
     expect(createWindowsOutputDecoderMock).toHaveBeenCalledTimes(2);
     expect(first).toHaveBeenCalledWith("first");
     expect(second).toHaveBeenCalledWith("second");
+  });
+
+  it("guards stream errors before output listeners are registered", async () => {
+    vi.useFakeTimers();
+    setPlatform("win32");
+    const { child, emitExit } = createStubChild(6666);
+    spawnWithFallbackMock.mockResolvedValue({
+      child,
+      usedFallback: false,
+    });
+    const adapter = await createChildAdapter({
+      argv: ["node", "-e", "setTimeout(() => {}, 1000)"],
+      stdinMode: "pipe-open",
+    });
+
+    const stdoutErr = new Error("simulated stdout pipe error");
+    const stderrErr = new Error("simulated stderr pipe error");
+    const settled = vi.fn();
+    void adapter.wait().then(settled);
+
+    emitExit(0, null);
+    expect(() => child.stdout?.emit("error", stdoutErr)).not.toThrow();
+    expect(() => child.stderr?.emit("error", stderrErr)).not.toThrow();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(settled).not.toHaveBeenCalled();
+
+    adapter.onStdout(() => {});
+    adapter.onStdout(() => {});
+    adapter.onStderr(() => {});
+    adapter.onStderr(() => {});
+
+    expect(child.stdout?.listenerCount("error")).toBe(1);
+    expect(child.stderr?.listenerCount("error")).toBe(1);
+
+    child.stdout?.emit("close");
+    child.stderr?.emit("close");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toHaveBeenCalledWith({ code: 0, signal: null });
   });
 });

@@ -1,3 +1,4 @@
+// Synology Chat plugin module implements channel mocks behavior.
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Mock } from "vitest";
 import { vi } from "vitest";
@@ -13,7 +14,7 @@ export const registerPluginHttpRouteMock: Mock<(params: RegisteredRoute) => () =
 );
 
 export const dispatchReplyWithBufferedBlockDispatcher: Mock<
-  () => Promise<{ counts: Record<string, number> }>
+  (_params: unknown) => Promise<{ counts: Record<string, number> }>
 > = vi.fn().mockResolvedValue({ counts: {} });
 export const finalizeInboundContextMock: Mock<
   (ctx: Record<string, unknown>) => Record<string, unknown>
@@ -141,7 +142,7 @@ vi.mock("./runtime.js", () => ({
         resolveStorePath: vi.fn(() => "/tmp/openclaw/synology-chat-sessions.json"),
         recordInboundSession: vi.fn(async () => undefined),
       },
-      turn: {
+      inbound: {
         run: vi.fn(async (params) => {
           const input = await params.adapter.ingest(params.raw);
           if (!input) {
@@ -151,7 +152,7 @@ vi.mock("./runtime.js", () => ({
             kind: "message",
             canStartAgentTurn: true,
           });
-          const dispatchResult = await resolved.dispatchReplyWithBufferedBlockDispatcher({
+          const dispatchResult = await dispatchReplyWithBufferedBlockDispatcher({
             ctx: resolved.ctxPayload,
             cfg: mockRuntimeConfig,
             dispatcherOptions: {
@@ -165,7 +166,7 @@ vi.mock("./runtime.js", () => ({
             dispatched: true,
             dispatchResult,
             ctxPayload: resolved.ctxPayload,
-            routeSessionKey: resolved.routeSessionKey,
+            routeSessionKey: resolved.route.sessionKey,
           };
         }),
         buildContext: buildChannelInboundEventContextMock,

@@ -1,14 +1,19 @@
+// Tests APNS push signing and request construction.
 import { generateKeyPairSync } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
 import http2 from "node:http2";
 import net from "node:net";
+import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startProxy, stopProxy, type ProxyHandle } from "./net/proxy/proxy-lifecycle.js";
+import { appendApnsResponseBodyCapture, createApnsResponseBodyCapture } from "./push-apns-http2.js";
 import {
   sendApnsAlert,
   sendApnsBackgroundWake,
   sendApnsExecApprovalAlert,
   sendApnsExecApprovalResolvedWake,
+  sendApnsPluginApprovalAlert,
+  sendApnsPluginApprovalResolvedWake,
 } from "./push-apns.js";
 
 const testAuthPrivateKey = generateKeyPairSync("ec", {
@@ -103,15 +108,17 @@ function createRelayApnsSendFixture(params: {
   nodeId: string;
   relayHandle?: string;
   tokenDebugSuffix?: string;
+  environment?: "sandbox" | "production";
   sendResult: {
     ok: boolean;
     status: number;
-    environment: "production";
+    environment: "sandbox" | "production";
     apnsId?: string;
     reason?: string;
     tokenSuffix?: string;
   };
 }) {
+  const environment = params.environment ?? "production";
   return {
     send: vi.fn().mockResolvedValue(params.sendResult),
     registration: {
@@ -121,7 +128,7 @@ function createRelayApnsSendFixture(params: {
       sendGrant: "send-grant-123",
       installationId: "install-123",
       topic: "ai.openclaw.ios",
-      environment: "production" as const,
+      environment,
       distribution: "official" as const,
       updatedAtMs: 1,
       tokenDebugSuffix: params.tokenDebugSuffix,
@@ -196,12 +203,14 @@ function requirePayload(sendRequest: Record<string, unknown>) {
   return requireRecord(sendRequest.payload, "APNs payload");
 }
 
-async function startFakeApnsServer(): Promise<{
+async function startFakeApnsServer(params?: { responseBody?: string; status?: number }): Promise<{
   port: number;
   requests: CapturedApnsRequest[];
   stop: () => Promise<void>;
 }> {
   const requests: CapturedApnsRequest[] = [];
+  const responseBody = params?.responseBody ?? "";
+  const status = params?.status ?? 200;
   const server = http2.createSecureServer({
     key: testApnsServerKeyPem,
     cert: testApnsServerCert,
@@ -215,8 +224,8 @@ async function startFakeApnsServer(): Promise<{
     });
     stream.on("end", () => {
       requests.push({ headers, body });
-      stream.respond({ ":status": 200, "apns-id": "proxied-apns-id" });
-      stream.end();
+      stream.respond({ ":status": status, "apns-id": "proxied-apns-id" });
+      stream.end(responseBody);
     });
   });
   const port = await listen(server);
@@ -277,6 +286,19 @@ afterEach(async () => {
 });
 
 describe("push APNs send semantics", () => {
+  it("bounds APNs response body capture", () => {
+    const capture = createApnsResponseBodyCapture();
+
+    appendApnsResponseBodyCapture(capture, "abc", 5);
+    appendApnsResponseBodyCapture(capture, "def", 5);
+
+    expect(capture).toEqual({
+      text: "abcde",
+      bytes: 6,
+      truncated: true,
+    });
+  });
+
   it("sends alert pushes with alert headers and payload", async () => {
     const { send, registration, auth } = createDirectApnsSendFixture({
       nodeId: "ios-node-alert",
@@ -320,7 +342,7 @@ describe("push APNs send semantics", () => {
   it("routes direct APNs HTTP/2 requests through the active managed proxy", async () => {
     const apnsServer = await startFakeApnsServer();
     const proxy = await startConnectProxy(apnsServer.port);
-    let proxyHandle: ProxyHandle | null = null;
+    let proxyHandle: ProxyHandle | null | undefined;
     const previousTlsRejectUnauthorized = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
@@ -365,7 +387,57 @@ describe("push APNs send semantics", () => {
       } else {
         process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsRejectUnauthorized;
       }
-      await stopProxy(proxyHandle);
+      await stopProxy(proxyHandle ?? null);
+      await proxy.stop();
+      await apnsServer.stop();
+    }
+  });
+
+  it("bounds oversized direct APNs error bodies while preserving parseable reasons", async () => {
+    const apnsServer = await startFakeApnsServer({
+      status: 400,
+      responseBody: '{"reason":"BadDeviceToken"}' + " ".repeat(20_000),
+    });
+    const proxy = await startConnectProxy(apnsServer.port);
+    let proxyHandle: ProxyHandle | null | undefined;
+    const previousTlsRejectUnauthorized = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+    try {
+      proxyHandle = await startProxy({ enabled: true, proxyUrl: proxy.proxyUrl });
+      const { registration, auth } = createDirectApnsSendFixture({
+        nodeId: "ios-node-proxied-error-body",
+        environment: "sandbox",
+        sendResult: {
+          status: 200,
+          apnsId: "unused",
+          body: "",
+        },
+      });
+
+      const result = await sendApnsAlert({
+        registration,
+        nodeId: "ios-node-proxied-error-body",
+        title: "Wake",
+        body: "Ping",
+        auth,
+        timeoutMs: 2_500,
+      });
+
+      expectRecordFields(requireRecord(result, "APNs result"), {
+        ok: false,
+        status: 400,
+        apnsId: "proxied-apns-id",
+        reason: "BadDeviceToken",
+        transport: "direct",
+      });
+    } finally {
+      if (previousTlsRejectUnauthorized === undefined) {
+        delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+      } else {
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsRejectUnauthorized;
+      }
+      await stopProxy(proxyHandle ?? null);
       await proxy.stop();
       await apnsServer.stop();
     }
@@ -428,6 +500,7 @@ describe("push APNs send semantics", () => {
       registration,
       nodeId: "ios-node-approval-alert",
       approvalId: "approval-123",
+      gatewayDeviceId: "gateway-device-123",
       auth,
       requestSender: send,
     });
@@ -449,6 +522,7 @@ describe("push APNs send semantics", () => {
     expectRecordFields(openclawPayload, {
       kind: "exec.approval.requested",
       approvalId: "approval-123",
+      gatewayDeviceId: "gateway-device-123",
     });
     expect(typeof openclawPayload.ts).toBe("number");
     expectNoProperties(openclawPayload, [
@@ -478,6 +552,7 @@ describe("push APNs send semantics", () => {
       registration,
       nodeId: "ios-node-approval-cleanup",
       approvalId: "approval-123",
+      gatewayDeviceId: "gateway-device-123",
       auth,
       requestSender: send,
     });
@@ -493,10 +568,109 @@ describe("push APNs send semantics", () => {
     expectRecordFields(openclawPayload, {
       kind: "exec.approval.resolved",
       approvalId: "approval-123",
+      gatewayDeviceId: "gateway-device-123",
     });
     expect(typeof openclawPayload.ts).toBe("number");
     expect(result.ok).toBe(true);
     expect(result.transport).toBe("direct");
+  });
+
+  it("builds plugin approval alerts with request copy and a bounded body", async () => {
+    const { send, registration, auth } = createDirectApnsSendFixture({
+      nodeId: "ios-node-plugin-approval-alert",
+      environment: "sandbox",
+      sendResult: {
+        status: 200,
+        apnsId: "apns-plugin-approval-alert-id",
+        body: "",
+      },
+    });
+    const description = `${"x".repeat(255)}😀${"y".repeat(300)}`;
+
+    await sendApnsPluginApprovalAlert({
+      registration,
+      nodeId: "ios-node-plugin-approval-alert",
+      approvalId: "plugin:approval-123",
+      gatewayDeviceId: "gateway-device-123",
+      title: "Install plugin update",
+      description,
+      auth,
+      requestSender: send,
+    });
+
+    const payload = requirePayload(requireSendRequest(send));
+    expect(payload.aps).toEqual({
+      alert: {
+        title: "Install plugin update",
+        body: `${"x".repeat(255)}…`,
+      },
+      sound: "default",
+      category: "openclaw.plugin-approval",
+      "content-available": 1,
+    });
+    const openclawPayload = requireRecord(payload.openclaw, "openclaw payload");
+    expectRecordFields(openclawPayload, {
+      kind: "plugin.approval.requested",
+      approvalId: "plugin:approval-123",
+      gatewayDeviceId: "gateway-device-123",
+    });
+    expect(typeof openclawPayload.ts).toBe("number");
+    expectNoProperties(openclawPayload, [
+      "title",
+      "description",
+      "toolName",
+      "agentId",
+      "sessionKey",
+    ]);
+  });
+
+  it("falls back to the generic plugin approval title", async () => {
+    const { send, registration, auth } = createDirectApnsSendFixture({
+      nodeId: "ios-node-plugin-approval-fallback",
+      environment: "sandbox",
+      sendResult: { status: 200, apnsId: "apns-plugin-approval-fallback-id", body: "" },
+    });
+
+    await sendApnsPluginApprovalAlert({
+      registration,
+      nodeId: "ios-node-plugin-approval-fallback",
+      approvalId: "plugin:fallback",
+      gatewayDeviceId: "gateway-device-123",
+      title: "   ",
+      description: "Review this request.",
+      auth,
+      requestSender: send,
+    });
+
+    const aps = requireRecord(requirePayload(requireSendRequest(send)).aps, "APNs aps payload");
+    expect(requireRecord(aps.alert, "APNs alert").title).toBe("Approval required");
+  });
+
+  it("builds plugin approval cleanup pushes as silent background notifications", async () => {
+    const { send, registration, auth } = createDirectApnsSendFixture({
+      nodeId: "ios-node-plugin-approval-cleanup",
+      environment: "sandbox",
+      sendResult: { status: 200, apnsId: "apns-plugin-approval-cleanup-id", body: "" },
+    });
+
+    await sendApnsPluginApprovalResolvedWake({
+      registration,
+      nodeId: "ios-node-plugin-approval-cleanup",
+      approvalId: "plugin:approval-123",
+      gatewayDeviceId: "gateway-device-123",
+      auth,
+      requestSender: send,
+    });
+
+    const payload = requirePayload(requireSendRequest(send));
+    expect(payload.aps).toEqual({ "content-available": 1 });
+    const openclawPayload = requireRecord(payload.openclaw, "openclaw payload");
+    expectRecordFields(openclawPayload, {
+      kind: "plugin.approval.resolved",
+      approvalId: "plugin:approval-123",
+      gatewayDeviceId: "gateway-device-123",
+    });
+    expect(typeof openclawPayload.ts).toBe("number");
   });
 
   it("parses direct send failures and clamps sub-second timeouts", async () => {
@@ -529,6 +703,30 @@ describe("push APNs send semantics", () => {
       tokenSuffix: "abcd1234",
       transport: "direct",
     });
+  });
+
+  it("caps oversized direct send timeouts", async () => {
+    const { send, registration, auth } = createDirectApnsSendFixture({
+      nodeId: "ios-node-direct-timeout-cap",
+      environment: "sandbox",
+      sendResult: {
+        status: 200,
+        apnsId: "apns-timeout-cap-id",
+        body: "{}",
+      },
+    });
+
+    await sendApnsAlert({
+      registration,
+      nodeId: "ios-node-direct-timeout-cap",
+      title: "Wake",
+      body: "Ping",
+      auth,
+      requestSender: send,
+      timeoutMs: Number.MAX_SAFE_INTEGER,
+    });
+
+    expect(requireSendRequest(send).timeoutMs).toBe(MAX_TIMER_TIMEOUT_MS);
   });
 
   it("fails closed before sending when direct registrations carry invalid topics", async () => {
@@ -696,6 +894,7 @@ describe("push APNs send semantics", () => {
       registration,
       nodeId: "ios-node-relay-approval-alert",
       approvalId: "approval-relay-1",
+      gatewayDeviceId: "gateway-device-relay",
       relayConfig,
       relayGatewayIdentity: gatewayIdentity,
       relayRequestSender: send,
@@ -715,6 +914,7 @@ describe("push APNs send semantics", () => {
     expectRecordFields(openclawPayload, {
       kind: "exec.approval.requested",
       approvalId: "approval-relay-1",
+      gatewayDeviceId: "gateway-device-relay",
     });
     expect(typeof openclawPayload.ts).toBe("number");
     expectNoProperties(openclawPayload, [
@@ -730,5 +930,28 @@ describe("push APNs send semantics", () => {
       environment: "production",
       transport: "relay",
     });
+  });
+
+  it("keeps bounded non-JSON error reasons UTF-16 well-formed", async () => {
+    const { send, registration, auth } = createDirectApnsSendFixture({
+      nodeId: "ios-node-utf16-reason",
+      environment: "sandbox",
+      sendResult: {
+        status: 400,
+        apnsId: "apns-utf16-reason-id",
+        body: `${"x".repeat(199)}🚀tail`,
+      },
+    });
+
+    const result = await sendApnsAlert({
+      registration,
+      nodeId: "ios-node-utf16-reason",
+      title: "Wake",
+      body: "Ping",
+      auth,
+      requestSender: send,
+    });
+
+    expect(requireRecord(result, "APNs result").reason).toBe("x".repeat(199));
   });
 });

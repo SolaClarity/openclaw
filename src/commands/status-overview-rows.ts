@@ -1,3 +1,6 @@
+// Builds overview table rows for `openclaw status` and `openclaw status --all`.
+// The row builders combine scan surfaces with health/session summaries while keeping rendering elsewhere.
+
 import { formatCliCommand } from "../cli/command-format.js";
 import type { HeartbeatEventPayload } from "../infra/heartbeat-events.js";
 import type { PluginCompatibilityNotice } from "../plugins/status.js";
@@ -34,6 +37,7 @@ function readModelPricingHealth(params: {
   if (params.health?.modelPricing) {
     return params.health.modelPricing;
   }
+  // Fast status can receive model pricing through the gateway probe before deep health is requested.
   const probeHealth = params.surface.gatewayProbe?.health;
   if (!probeHealth || typeof probeHealth !== "object") {
     return undefined;
@@ -66,6 +70,7 @@ function buildModelPricingOverviewValue(params: {
   return params.warn(`warning · optional pricing refresh degraded${detail}`);
 }
 
+/** Builds the default `openclaw status` overview rows from scan, health, memory, and session inputs. */
 export function buildStatusCommandOverviewRows(
   params: {
     opts: {
@@ -101,6 +106,15 @@ export function buildStatusCommandOverviewRows(
   const eventsValue = buildStatusEventsValue({
     queuedSystemEvents: params.summary.queuedSystemEvents,
   });
+  const degradedSecretOwners = params.summary.degradedSecretOwners ?? [];
+  const degradedSecretsValue =
+    degradedSecretOwners.length > 0
+      ? params.warn(
+          `${degradedSecretOwners.length} unavailable · ${degradedSecretOwners
+            .map((owner) => `${owner.ownerKind}:${owner.ownerId}`)
+            .join(", ")}`,
+        )
+      : null;
   const tasksValue = buildStatusTasksValue({
     summary: params.summary,
     warn: params.warn,
@@ -161,6 +175,7 @@ export function buildStatusCommandOverviewRows(
         ? [{ Item: "Update restart", Value: params.updateRestartValue }]
         : []),
       { Item: "Memory", Value: memoryValue },
+      ...(degradedSecretsValue ? [{ Item: "Degraded secrets", Value: degradedSecretsValue }] : []),
       { Item: "Plugin compatibility", Value: pluginCompatibilityValue },
       { Item: "Probes", Value: probesValue },
       { Item: "Events", Value: eventsValue },
@@ -181,6 +196,7 @@ export function buildStatusCommandOverviewRows(
   });
 }
 
+/** Builds the expanded status-all overview rows, including config and security hints. */
 export function buildStatusAllOverviewRows(params: {
   surface: StatusOverviewSurface;
   osLabel: string;

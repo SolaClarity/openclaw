@@ -1,8 +1,14 @@
-import type { StreamFn } from "@earendil-works/pi-agent-core";
-import { streamSimple } from "@earendil-works/pi-ai";
+// Kimi Coding plugin module implements stream behavior.
+import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
+import {
+  streamSimple,
+  type AssistantMessage,
+  type AssistantMessageEvent,
+} from "openclaw/plugin-sdk/llm";
 import type { ProviderWrapStreamFnContext } from "openclaw/plugin-sdk/plugin-entry";
 import { streamWithPayloadPatch } from "openclaw/plugin-sdk/provider-stream-shared";
 import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isKimiK3ModelId } from "./provider-policy-api.js";
 
 const TOOL_CALLS_SECTION_BEGIN = "<|tool_calls_section_begin|>";
 const TOOL_CALLS_SECTION_END = "<|tool_calls_section_end|>";
@@ -18,6 +24,9 @@ type KimiToolCallBlock = {
 };
 
 type KimiThinkingType = "enabled" | "disabled";
+interface MutableAssistantMessageEventStream extends AsyncIterable<AssistantMessageEvent> {
+  result: () => Promise<AssistantMessage>;
+}
 type KimiThinkingConfig = {
   type: KimiThinkingType;
   budget_tokens?: number;
@@ -160,7 +169,7 @@ function resolveKimiAnthropicThinkingBudgetTokens(
   return KIMI_ANTHROPIC_THINKING_BUDGETS[thinkingLevel];
 }
 
-export function resolveKimiThinkingConfig(params: {
+function resolveKimiThinkingConfig(params: {
   configuredThinking: unknown;
   thinkingLevel?: KimiThinkingLevel;
 }): KimiThinkingConfig {
@@ -179,11 +188,15 @@ export function resolveKimiThinkingConfig(params: {
     : { type: "enabled", budget_tokens: levelBudgetTokens };
 }
 
-export function resolveKimiThinkingType(params: {
+function resolveKimiK3ThinkingType(params: {
   configuredThinking: unknown;
   thinkingLevel?: KimiThinkingLevel;
 }): KimiThinkingType {
-  return resolveKimiThinkingConfig(params).type;
+  const configured = normalizeKimiThinkingConfig(params.configuredThinking);
+  if (configured) {
+    return configured.type;
+  }
+  return params.thinkingLevel === "off" ? "disabled" : "enabled";
 }
 
 function stripTaggedToolCallCounter(value: string): string {
@@ -302,43 +315,58 @@ function rewriteKimiTaggedToolCallsInMessage(message: unknown): void {
   }
 }
 
-function wrapStreamMessageObjects(
-  stream: ReturnType<typeof streamSimple>,
+function transformKimiStreamEvent(
+  value: unknown,
   transformMessage: (message: unknown) => void,
-): ReturnType<typeof streamSimple> {
-  const originalResult = stream.result.bind(stream);
-  stream.result = async () => {
-    const message = await originalResult();
+): void {
+  const event =
+    value && typeof value === "object"
+      ? (value as { partial?: unknown; message?: unknown })
+      : undefined;
+  if (!event) {
+    return;
+  }
+  for (const message of [event.partial, event.message]) {
     transformMessage(message);
-    return message;
-  };
+  }
+}
 
-  const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
-  (stream as { [Symbol.asyncIterator]: typeof originalAsyncIterator })[Symbol.asyncIterator] =
-    function () {
-      const iterator = originalAsyncIterator();
-      return {
-        async next() {
-          const result = await iterator.next();
-          if (!result.done && result.value && typeof result.value === "object") {
-            const event = result.value as { partial?: unknown; message?: unknown };
-            transformMessage(event.partial);
-            transformMessage(event.message);
-          }
-          return result;
-        },
-        async return(value?: unknown) {
-          return iterator.return?.(value) ?? { done: true as const, value: undefined };
-        },
-        async throw(error?: unknown) {
-          return iterator.throw?.(error) ?? { done: true as const, value: undefined };
-        },
-      };
+function wrapStreamMessageObjects(
+  stream: MutableAssistantMessageEventStream,
+  transformMessage: (message: unknown) => void,
+): MutableAssistantMessageEventStream {
+  const readFinalMessage = stream.result.bind(stream);
+  Object.assign(stream, {
+    async result() {
+      const message = await readFinalMessage();
+      transformMessage(message);
+      return message;
+    },
+  });
+
+  const createIterator = stream[Symbol.asyncIterator].bind(stream);
+  stream[Symbol.asyncIterator] = () => {
+    const iterator = createIterator();
+    return {
+      async next() {
+        const step = await iterator.next();
+        if (!step.done) {
+          transformKimiStreamEvent(step.value, transformMessage);
+        }
+        return step;
+      },
+      async return(value?: unknown) {
+        return iterator.return?.(value) ?? { done: true as const, value: undefined };
+      },
+      async throw(error?: unknown) {
+        return iterator.throw?.(error) ?? { done: true as const, value: undefined };
+      },
     };
+  };
   return stream;
 }
 
-export function createKimiToolCallMarkupWrapper(baseStreamFn: StreamFn | undefined): StreamFn {
+function createKimiToolCallMarkupWrapper(baseStreamFn: StreamFn | undefined): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) => {
     const maybeStream = underlying(model, context, options);
@@ -351,13 +379,44 @@ export function createKimiToolCallMarkupWrapper(baseStreamFn: StreamFn | undefin
   };
 }
 
-export function createKimiThinkingWrapper(
+function createKimiThinkingWrapper(
   baseStreamFn: StreamFn | undefined,
   thinkingConfig: KimiThinkingConfig | KimiThinkingType,
+  k3ThinkingType: KimiThinkingType,
 ): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) =>
     streamWithPayloadPatch(underlying, model, context, options, (payloadObj) => {
+      if (model.api === "anthropic-messages" && isKimiK3ModelId(model.id)) {
+        const outputConfig = payloadObj.output_config;
+        if (k3ThinkingType === "disabled") {
+          payloadObj.thinking = { type: "disabled" };
+          if (outputConfig && typeof outputConfig === "object" && !Array.isArray(outputConfig)) {
+            const nextOutputConfig = { ...outputConfig } as Record<string, unknown>;
+            delete nextOutputConfig.effort;
+            if (Object.keys(nextOutputConfig).length > 0) {
+              payloadObj.output_config = nextOutputConfig;
+            } else {
+              delete payloadObj.output_config;
+            }
+          } else {
+            delete payloadObj.output_config;
+          }
+        } else {
+          // Kimi Code's Anthropic endpoint uses adaptive thinking plus max effort for K3.
+          payloadObj.thinking = { type: "adaptive", display: "summarized" };
+          payloadObj.output_config =
+            outputConfig && typeof outputConfig === "object" && !Array.isArray(outputConfig)
+              ? { ...outputConfig, effort: "max" }
+              : { effort: "max" };
+        }
+        delete payloadObj.reasoning;
+        delete payloadObj.reasoning_effort;
+        delete payloadObj.reasoningEffort;
+        stripAnthropicCacheControlMarkers(payloadObj);
+        return;
+      }
+
       const normalized =
         typeof thinkingConfig === "string" ? { type: thinkingConfig } : thinkingConfig;
       payloadObj.thinking =
@@ -372,7 +431,49 @@ export function createKimiThinkingWrapper(
       delete payloadObj.reasoning;
       delete payloadObj.reasoning_effort;
       delete payloadObj.reasoningEffort;
+      stripAnthropicCacheControlMarkers(payloadObj);
     });
+}
+
+function stripContentBlockCacheControl(block: unknown): void {
+  if (!block || typeof block !== "object") {
+    return;
+  }
+
+  const record = block as Record<string, unknown>;
+  delete record.cache_control;
+
+  if (record.type === "tool_result" && Array.isArray(record.content)) {
+    for (const nestedBlock of record.content) {
+      stripContentBlockCacheControl(nestedBlock);
+    }
+  }
+}
+
+function stripContentArrayCacheControl(value: unknown): void {
+  if (!Array.isArray(value)) {
+    return;
+  }
+
+  for (const block of value) {
+    stripContentBlockCacheControl(block);
+  }
+}
+
+function stripAnthropicCacheControlMarkers(payloadObj: Record<string, unknown>): void {
+  stripContentArrayCacheControl(payloadObj.system);
+
+  if (!Array.isArray(payloadObj.messages)) {
+    return;
+  }
+
+  for (const message of payloadObj.messages) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+
+    stripContentArrayCacheControl((message as Record<string, unknown>).content);
+  }
 }
 
 export function wrapKimiProviderStream(ctx: ProviderWrapStreamFnContext): StreamFn {
@@ -380,5 +481,11 @@ export function wrapKimiProviderStream(ctx: ProviderWrapStreamFnContext): Stream
     configuredThinking: ctx.extraParams?.thinking,
     thinkingLevel: ctx.thinkingLevel,
   });
-  return createKimiToolCallMarkupWrapper(createKimiThinkingWrapper(ctx.streamFn, thinkingConfig));
+  const k3ThinkingType = resolveKimiK3ThinkingType({
+    configuredThinking: ctx.extraParams?.thinking,
+    thinkingLevel: ctx.thinkingLevel,
+  });
+  return createKimiToolCallMarkupWrapper(
+    createKimiThinkingWrapper(ctx.streamFn, thinkingConfig, k3ThinkingType),
+  );
 }

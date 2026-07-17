@@ -1,23 +1,21 @@
+// Discord plugin module implements message handler behavior.
 import {
   createChannelInboundDebouncer,
   shouldDebounceTextInbound,
 } from "openclaw/plugin-sdk/channel-inbound";
-import { danger, logVerbose } from "openclaw/plugin-sdk/runtime-env";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import type { ChannelReplayClaimHandle } from "openclaw/plugin-sdk/persistent-dedupe";
+import { danger } from "openclaw/plugin-sdk/runtime-env";
 import { resolveOpenProviderRuntimeGroupPolicy } from "openclaw/plugin-sdk/runtime-group-policy";
-import { createDiscordRestClient } from "../client.js";
 import type { Client } from "../internal/discord.js";
 import {
   buildDiscordInboundReplayKey,
-  claimDiscordInboundReplay,
-  commitDiscordInboundReplay,
   createDiscordInboundReplayGuard,
   DiscordRetryableInboundError,
-  releaseDiscordInboundReplay,
 } from "./inbound-dedupe.js";
 import { buildDiscordInboundJob } from "./inbound-job.js";
 import type { DiscordMessageEvent, DiscordMessageHandler } from "./listeners.js";
 import { applyImplicitReplyBatchGate } from "./message-handler.batch-gate.js";
-import type { DiscordMessagePreflightContext } from "./message-handler.preflight.js";
 import type { DiscordMessagePreflightParams } from "./message-handler.preflight.types.js";
 import {
   createDiscordMessageRunQueue,
@@ -29,7 +27,6 @@ import {
   resolveDiscordMessageText,
 } from "./message-utils.js";
 import type { DiscordMonitorStatusSink } from "./status.js";
-import { sendTyping } from "./typing.js";
 
 type PreflightDiscordMessage =
   typeof import("./message-handler.preflight.js").preflightDiscordMessage;
@@ -47,51 +44,16 @@ type DiscordMessageHandlerTestingHooks = DiscordMessageRunQueueTestingHooks & {
   preflightDiscordMessage?: PreflightDiscordMessage;
 };
 
-let messagePreflightRuntimePromise:
-  | Promise<typeof import("./message-handler.preflight.js")>
-  | undefined;
+const loadMessagePreflightRuntime = createLazyRuntimeModule(
+  () => import("./message-handler.preflight.js"),
+);
 
-async function loadMessagePreflightRuntime() {
-  messagePreflightRuntimePromise ??= import("./message-handler.preflight.js");
-  return await messagePreflightRuntimePromise;
-}
-
-export type DiscordMessageHandlerWithLifecycle = DiscordMessageHandler & {
+type DiscordMessageHandlerWithLifecycle = DiscordMessageHandler & {
   deactivate: () => void;
 };
 
 function isNonEmptyString(value: string | undefined): value is string {
   return typeof value === "string" && value.length > 0;
-}
-
-function shouldSendAcceptedDiscordTypingCue(ctx: DiscordMessagePreflightContext): boolean {
-  if (ctx.abortSignal?.aborted) {
-    return false;
-  }
-  if (!ctx.isDirectMessage || ctx.isGuildMessage || ctx.isGroupDm) {
-    return false;
-  }
-  if (!ctx.messageText.trim()) {
-    return false;
-  }
-  const configuredTypingMode = ctx.cfg.session?.typingMode ?? ctx.cfg.agents?.defaults?.typingMode;
-  return configuredTypingMode === undefined || configuredTypingMode === "instant";
-}
-
-function queueAcceptedDiscordTypingCue(ctx: DiscordMessagePreflightContext): void {
-  if (!shouldSendAcceptedDiscordTypingCue(ctx)) {
-    return;
-  }
-  const { rest } = createDiscordRestClient({
-    cfg: ctx.cfg,
-    token: ctx.token,
-    accountId: ctx.accountId,
-  });
-  void sendTyping({ rest, channelId: ctx.messageChannelId }).catch((err) => {
-    logVerbose(
-      `discord early typing cue failed for channel ${ctx.messageChannelId}: ${String(err)}`,
-    );
-  });
 }
 
 export function createDiscordMessageHandler(
@@ -112,7 +74,6 @@ export function createDiscordMessageHandler(
     runtime: params.runtime,
     setStatus: params.setStatus,
     abortSignal: params.abortSignal,
-    replayGuard,
     testing: params.testing,
   });
 
@@ -120,7 +81,7 @@ export function createDiscordMessageHandler(
     data: DiscordMessageEvent;
     client: Client;
     abortSignal?: AbortSignal;
-    replayKey?: string;
+    replayClaim?: ChannelReplayClaimHandle;
   }>({
     cfg: params.cfg,
     channel: "discord",
@@ -158,14 +119,14 @@ export function createDiscordMessageHandler(
       if (!last) {
         return;
       }
-      const replayKeys = entries.map((entry) => entry.replayKey).filter(isNonEmptyString);
+      const replayClaims = entries
+        .map((entry) => entry.replayClaim)
+        .filter((claim): claim is ChannelReplayClaimHandle => claim !== undefined);
       const abortSignal = last.abortSignal;
       if (abortSignal?.aborted) {
-        releaseDiscordInboundReplay({
-          replayKeys,
-          error: abortSignal.reason,
-          replayGuard,
-        });
+        for (const claim of replayClaims) {
+          claim.release({ error: abortSignal.reason });
+        }
         return;
       }
       try {
@@ -182,12 +143,11 @@ export function createDiscordMessageHandler(
             client: last.client,
           });
           if (!ctx) {
-            await commitDiscordInboundReplay({ replayKeys, replayGuard });
+            await Promise.all(replayClaims.map((claim) => claim.commit()));
             return;
           }
           applyImplicitReplyBatchGate(ctx, params.replyToMode, false);
-          queueAcceptedDiscordTypingCue(ctx);
-          messageRunQueue.enqueue(buildDiscordInboundJob(ctx, { replayKeys }));
+          messageRunQueue.enqueue(buildDiscordInboundJob(ctx, { replayClaims }));
           return;
         }
         const combinedBaseText = entries
@@ -232,7 +192,7 @@ export function createDiscordMessageHandler(
           client: last.client,
         });
         if (!ctx) {
-          await commitDiscordInboundReplay({ replayKeys, replayGuard });
+          await Promise.all(replayClaims.map((claim) => claim.commit()));
           return;
         }
         applyImplicitReplyBatchGate(ctx, params.replyToMode, true);
@@ -249,19 +209,20 @@ export function createDiscordMessageHandler(
             ctxBatch.MessageSidLast = ids[ids.length - 1];
           }
         }
-        queueAcceptedDiscordTypingCue(ctx);
-        messageRunQueue.enqueue(buildDiscordInboundJob(ctx, { replayKeys }));
+        messageRunQueue.enqueue(buildDiscordInboundJob(ctx, { replayClaims }));
       } catch (error) {
         if (error instanceof DiscordRetryableInboundError) {
-          releaseDiscordInboundReplay({ replayKeys, error, replayGuard });
+          for (const claim of replayClaims) {
+            claim.release({ error });
+          }
         } else {
-          await commitDiscordInboundReplay({ replayKeys, replayGuard });
+          await Promise.all(replayClaims.map((claim) => claim.commit()));
         }
         throw error;
       }
     },
     onError: (err) => {
-      params.runtime.error?.(danger(`discord debounce flush failed: ${String(err)}`));
+      params.runtime.error(danger(`discord debounce flush failed: ${String(err)}`));
     },
   });
 
@@ -283,12 +244,8 @@ export function createDiscordMessageHandler(
         accountId: params.accountId,
         data,
       });
-      if (
-        !(await claimDiscordInboundReplay({
-          replayKey,
-          replayGuard,
-        }))
-      ) {
+      const replayClaim = await replayGuard.claim(replayKey);
+      if (replayClaim.kind !== "claimed" && replayClaim.kind !== "invalid") {
         return;
       }
 
@@ -296,10 +253,10 @@ export function createDiscordMessageHandler(
         data,
         client,
         abortSignal: options?.abortSignal,
-        replayKey: replayKey ?? undefined,
+        ...(replayClaim.kind === "claimed" ? { replayClaim: replayClaim.handle } : {}),
       });
     } catch (err) {
-      params.runtime.error?.(danger(`handler failed: ${String(err)}`));
+      params.runtime.error(danger(`handler failed: ${String(err)}`));
     }
   };
 

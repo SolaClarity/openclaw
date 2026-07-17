@@ -1,3 +1,5 @@
+// Runs oxlint with local heavy-check policy, sparse-checkout filtering, and
+// plugin package-boundary artifact preparation when needed.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -7,7 +9,7 @@ import {
   resolveLocalHeavyCheckEnv,
   shouldAcquireLocalHeavyCheckLockForOxlint,
 } from "./lib/local-heavy-check-runtime.mjs";
-import { runManagedCommand } from "./lib/managed-child-process.mjs";
+import { createManagedCommandInvocation, runManagedCommand } from "./lib/managed-child-process.mjs";
 
 const oxlintPath = path.resolve("node_modules", ".bin", "oxlint");
 const PREPARE_EXTENSION_BOUNDARY_ARGS = [
@@ -37,11 +39,18 @@ const OXLINT_VALUE_FLAGS = new Set([
   "--tsconfig",
   "--warn",
 ]);
+const OPENCLAW_FOCUSED_CONFIG_FLAG = "--openclaw-focused-config";
 
+/**
+ * Returns whether oxlint args need package-boundary declaration artifacts first.
+ */
 export function shouldPrepareExtensionPackageBoundaryArtifacts(args) {
   return !args.some((arg) => OXLINT_PREPARE_SKIP_FLAGS.has(arg));
 }
 
+/**
+ * Drops tracked-but-missing sparse-checkout targets so narrow sparse checks can pass.
+ */
 export function filterSparseMissingOxlintTargets(
   args,
   {
@@ -138,22 +147,32 @@ export function filterSparseMissingOxlintTargets(
 }
 
 function getSparseCheckoutEnabled({ cwd }) {
-  const result = spawnSync("git", ["config", "--get", "--bool", "core.sparseCheckout"], {
+  const git = createManagedCommandInvocation({
+    args: ["config", "--get", "--bool", "core.sparseCheckout"],
+    bin: "git",
+  });
+  const result = spawnSync(git.command, git.args, {
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    shell: process.platform === "win32",
+    shell: git.shell,
+    windowsVerbatimArguments: git.windowsVerbatimArguments,
   });
 
   return result.status === 0 && result.stdout.trim() === "true";
 }
 
 function hasTrackedPath({ cwd, target }) {
-  const result = spawnSync("git", ["ls-files", "--", target], {
+  const git = createManagedCommandInvocation({
+    args: ["ls-files", "--", target],
+    bin: "git",
+  });
+  const result = spawnSync(git.command, git.args, {
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    shell: process.platform === "win32",
+    shell: git.shell,
+    windowsVerbatimArguments: git.windowsVerbatimArguments,
   });
 
   return result.status === 0 && result.stdout.trim().length > 0;
@@ -184,11 +203,18 @@ async function prepareExtensionPackageBoundaryArtifacts(env) {
   }
 }
 
+/**
+ * Applies wrapper policy and runs oxlint with the final argument list.
+ */
 export async function main(argv = process.argv.slice(2), runtimeEnv = process.env) {
-  const { args: policyArgs, env } = applyLocalOxlintPolicy(
-    argv,
-    resolveLocalHeavyCheckEnv(runtimeEnv),
-  );
+  const focusedConfig = argv.includes(OPENCLAW_FOCUSED_CONFIG_FLAG);
+  const oxlintArgs = argv.filter((arg) => arg !== OPENCLAW_FOCUSED_CONFIG_FLAG);
+  const localEnv = resolveLocalHeavyCheckEnv(runtimeEnv);
+  // Focused configs are syntax-only guards; keep wrapper process handling
+  // without the broad type-aware policy or package artifact preparation.
+  const { args: policyArgs, env } = focusedConfig
+    ? { args: oxlintArgs, env: localEnv }
+    : applyLocalOxlintPolicy(oxlintArgs, localEnv);
   const sparseTargets = filterSparseMissingOxlintTargets(policyArgs);
   const finalArgs = sparseTargets.args;
   if (sparseTargets.skippedTargets.length > 0) {
@@ -208,7 +234,7 @@ export async function main(argv = process.argv.slice(2), runtimeEnv = process.en
   }
 
   const releaseLock =
-    env.OPENCLAW_OXLINT_SKIP_LOCK === "1"
+    env.OPENCLAW_OXLINT_SKIP_LOCK === "1" || focusedConfig
       ? () => {}
       : shouldAcquireLocalHeavyCheckLockForOxlint(finalArgs, {
             cwd: process.cwd(),
@@ -223,6 +249,7 @@ export async function main(argv = process.argv.slice(2), runtimeEnv = process.en
 
   try {
     if (
+      !focusedConfig &&
       env.OPENCLAW_OXLINT_SKIP_PREPARE !== "1" &&
       shouldPrepareExtensionPackageBoundaryArtifacts(finalArgs)
     ) {

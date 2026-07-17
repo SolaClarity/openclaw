@@ -1,4 +1,6 @@
+// Feishu plugin module implements lifecycle support behavior.
 import { vi, type Mock } from "vitest";
+import { feishuDedupeState } from "./dedup-state.js";
 
 type BoundConversation = {
   bindingId: string;
@@ -19,11 +21,13 @@ type DispatchReplyContext = Record<string, unknown> & {
 };
 type DispatchReplyDispatcher = {
   sendFinalReply: (payload: { text: string }) => unknown;
+  getFailedCounts?: UnknownMock;
 };
 type FeishuReplyDispatcherMockValue = {
   dispatcher: DispatchReplyDispatcher;
   replyOptions: Record<string, never>;
   markDispatchIdle: () => unknown;
+  ensureNoVisibleReplyFallback?: AsyncUnknownMock;
 };
 type CreateFeishuReplyDispatcherMock = Mock<(params?: unknown) => FeishuReplyDispatcherMockValue>;
 type DispatchReplyFromConfigMock = Mock<
@@ -86,6 +90,7 @@ export function getFeishuLifecycleTestMocks(): FeishuLifecycleTestMocks {
 }
 
 export function resetFeishuLifecycleTestMocks(): void {
+  feishuDedupeState.reset();
   for (const mock of Object.values(feishuLifecycleTestMocks)) {
     mock.mockReset();
   }
@@ -122,6 +127,31 @@ const {
   sendCardFeishuMock,
 } = feishuLifecycleTestMocks;
 
+vi.mock("openclaw/plugin-sdk/reply-runtime", async () => {
+  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/reply-runtime")>(
+    "openclaw/plugin-sdk/reply-runtime",
+  );
+  return {
+    ...actual,
+    dispatchInboundMessage: (params: {
+      ctx: DispatchReplyContext;
+      dispatcher: DispatchReplyDispatcher;
+      onSettled?: () => unknown;
+    }) => {
+      const ctx = feishuLifecycleTestMocks.finalizeInboundContextMock(params.ctx);
+      return feishuLifecycleTestMocks.withReplyDispatcherMock({
+        dispatcher: params.dispatcher,
+        onSettled: params.onSettled,
+        run: () =>
+          feishuLifecycleTestMocks.dispatchReplyFromConfigMock({
+            ctx,
+            dispatcher: params.dispatcher,
+          }),
+      });
+    },
+  };
+});
+
 vi.mock("./client.js", () => {
   return {
     FEISHU_HTTP_TIMEOUT_ENV_VAR: "OPENCLAW_FEISHU_HTTP_TIMEOUT_MS",
@@ -137,7 +167,6 @@ vi.mock("./client.js", () => {
       start: vi.fn(),
     })),
     createEventDispatcher: createEventDispatcherMock,
-    getFeishuClient: vi.fn(() => null),
     getFeishuUserAgent: vi.fn(() => "openclaw-feishu-test"),
     pluginVersion: "test",
     setFeishuClientRuntimeForTest: vi.fn(),

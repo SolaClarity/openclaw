@@ -1,9 +1,10 @@
+// Commander registration for channel discovery, setup, status, auth, and diagnostics commands.
 import type { Command } from "commander";
+import { formatDocsLink } from "../../packages/terminal-core/src/links.js";
+import { theme } from "../../packages/terminal-core/src/theme.js";
 import { danger } from "../globals.js";
 import { defaultRuntime } from "../runtime.js";
 import { createLazyImportLoader } from "../shared/lazy-promise.js";
-import { formatDocsLink } from "../terminal/links.js";
-import { theme } from "../terminal/theme.js";
 import { resolveCliArgvInvocation } from "./argv-invocation.js";
 import { runChannelLogin, runChannelLogout } from "./channel-auth.js";
 import { formatCliChannelOptions } from "./channel-options.js";
@@ -50,10 +51,21 @@ function getOptionNames(command: Command): string[] {
   return command.options.map((option) => option.attributeName());
 }
 
+function resolveChannelsAddOptions(
+  channelArg: string | undefined,
+  opts: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ...opts,
+    channel: opts.channel ?? channelArg,
+  };
+}
+
 function shouldRegisterChannelSetupOptions(
   argv: string[] = process.argv,
   options: RegisterChannelsCliOptions = {},
 ): boolean {
+  // Channel-specific setup flags are expensive to load and only needed on `channels add`.
   if (options.includeSetupOptions) {
     return true;
   }
@@ -196,6 +208,7 @@ export async function registerChannelsCli(
   const addCommand = channels
     .command("add")
     .description("Add or update a channel account")
+    .argument("[channel]", "Channel id")
     .addHelpText(
       "after",
       () =>
@@ -221,6 +234,7 @@ export async function registerChannelsCli(
     .option("--cli-path <path>", "Channel CLI path")
     .option("--url <url>", "Channel setup URL")
     .option("--base-url <url>", "Channel base URL")
+    .option("--workspace <workspace>", "Channel workspace id, slug, or name")
     .option("--http-url <url>", "Channel HTTP service URL")
     .option("--auth-dir <path>", "Channel auth directory override")
     .option("--use-env", "Use env-backed credentials when supported", false);
@@ -229,11 +243,13 @@ export async function registerChannelsCli(
     await addChannelSetupOptions(addCommand);
   }
 
-  addCommand.action(async (opts, command) => {
+  addCommand.action(async (channelArg: string | undefined, opts, command) => {
     await runChannelsCommand(async () => {
       const { channelsAddCommand } = await loadChannelsCommands();
       const hasFlags = hasExplicitOptions(command, getOptionNames(command));
-      await channelsAddCommand(opts, defaultRuntime, { hasFlags });
+      await channelsAddCommand(resolveChannelsAddOptions(channelArg, opts), defaultRuntime, {
+        hasFlags,
+      });
     });
   });
 

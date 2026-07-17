@@ -1,9 +1,17 @@
 #!/usr/bin/env node
+// Boots the OpenClaw CLI entry point under Node.
+// CLI process entrypoint for OpenClaw command execution.
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { isRootHelpInvocation } from "./cli/argv.js";
 import { parseCliContainerArgs, resolveCliContainerTarget } from "./cli/container-target.js";
+import {
+  tryOutputPrecomputedCommandHelp,
+  type PrecomputedCommandHelpDeps,
+} from "./cli/precomputed-help.js";
 import { applyCliProfileEnv, parseCliProfileArgs } from "./cli/profile.js";
+import type { RootHelpRenderOptions } from "./cli/program/root-help.js";
+import { createGatewayStartupTrace } from "./cli/startup-trace.js";
 import { normalizeWindowsArgv } from "./cli/windows-argv.js";
 import {
   enableOpenClawCompileCache,
@@ -12,7 +20,7 @@ import {
 } from "./entry.compile-cache.js";
 import { buildCliRespawnPlan, runCliRespawnPlan } from "./entry.respawn.js";
 import { tryHandleRootVersionFastPath } from "./entry.version-fast-path.js";
-import { isTruthyEnvValue, normalizeEnv } from "./infra/env.js";
+import { normalizeEnv } from "./infra/env.js";
 import { isMainModule } from "./infra/is-main.js";
 import { ensureOpenClawExecMarkerOnProcess } from "./infra/openclaw-exec-env.js";
 import { installProcessWarningFilter } from "./infra/warning-filter.js";
@@ -21,6 +29,9 @@ const ENTRY_WRAPPER_PAIRS = [
   { wrapperBasename: "openclaw.mjs", entryBasename: "entry.js" },
   { wrapperBasename: "openclaw.js", entryBasename: "entry.js" },
 ] as const;
+
+const loadRootHelpLiveConfigModule = async () => await import("./cli/root-help-live-config.js");
+const loadRootHelpMetadataModule = async () => await import("./cli/root-help-metadata.js");
 
 function shouldForceReadOnlyAuthStore(argv: string[]): boolean {
   const tokens = argv.slice(2).filter((token) => token.length > 0 && !token.startsWith("-"));
@@ -32,40 +43,7 @@ function shouldForceReadOnlyAuthStore(argv: string[]): boolean {
   return false;
 }
 
-function createGatewayEntryStartupTrace(argv: string[]) {
-  const enabled =
-    isTruthyEnvValue(process.env.OPENCLAW_GATEWAY_STARTUP_TRACE) &&
-    argv.slice(2).includes("gateway");
-  const started = performance.now();
-  let last = started;
-  const emit = (name: string, durationMs: number, totalMs: number) => {
-    if (!enabled) {
-      return;
-    }
-    process.stderr.write(
-      `[gateway] startup trace: entry.${name} ${durationMs.toFixed(1)}ms total=${totalMs.toFixed(1)}ms\n`,
-    );
-  };
-  return {
-    mark(name: string) {
-      const now = performance.now();
-      emit(name, now - last, now - started);
-      last = now;
-    },
-    async measure<T>(name: string, run: () => Promise<T>): Promise<T> {
-      const before = performance.now();
-      try {
-        return await run();
-      } finally {
-        const now = performance.now();
-        emit(name, now - before, now - started);
-        last = now;
-      }
-    },
-  };
-}
-
-const gatewayEntryStartupTrace = createGatewayEntryStartupTrace(process.argv);
+const gatewayEntryStartupTrace = createGatewayStartupTrace(process.argv, "entry");
 
 // Guard: only run entry-point logic when this file is the main module.
 // The bundler may import entry.js as a shared dependency when dist/index.js
@@ -91,6 +69,8 @@ if (
     ensureOpenClawExecMarkerOnProcess();
     installProcessWarningFilter();
     normalizeEnv();
+    const { assertSupportedRuntime } = await import("./infra/runtime-guard.js");
+    assertSupportedRuntime();
 
     enableOpenClawCompileCache({
       installRoot,
@@ -157,7 +137,10 @@ export async function tryHandleRootHelpFastPath(
   argv: string[],
   deps: {
     outputPrecomputedRootHelpText?: () => boolean;
-    outputRootHelp?: () => void | Promise<void>;
+    outputRootHelp?: (options?: RootHelpRenderOptions) => void | Promise<void>;
+    loadRootHelpRenderOptionsForConfigSensitivePlugins?: (
+      env?: NodeJS.ProcessEnv,
+    ) => Promise<RootHelpRenderOptions | null>;
     onError?: (error: unknown) => void;
     env?: NodeJS.ProcessEnv;
   } = {},
@@ -175,20 +158,24 @@ export async function tryHandleRootHelpFastPath(
         "[openclaw] Failed to display help:",
         error instanceof Error ? (error.stack ?? error.message) : error,
       );
-      process.exitCode = 1;
+      process.exit(1);
     });
   try {
-    if (deps.outputRootHelp) {
-      await deps.outputRootHelp();
-      return true;
+    const loadRootHelpRenderOptionsForConfigSensitivePlugins =
+      deps.loadRootHelpRenderOptionsForConfigSensitivePlugins ??
+      (await loadRootHelpLiveConfigModule()).loadRootHelpRenderOptionsForConfigSensitivePlugins;
+    const liveRootHelpOptions = await loadRootHelpRenderOptionsForConfigSensitivePlugins(deps.env);
+    if (!liveRootHelpOptions) {
+      const outputPrecomputedRootHelpText =
+        deps.outputPrecomputedRootHelpText ??
+        (await loadRootHelpMetadataModule()).outputPrecomputedRootHelpText;
+      if (outputPrecomputedRootHelpText()) {
+        return true;
+      }
     }
-    const outputPrecomputedRootHelpText =
-      deps.outputPrecomputedRootHelpText ??
-      (await import("./cli/root-help-metadata.js")).outputPrecomputedRootHelpText;
-    if (!outputPrecomputedRootHelpText()) {
-      const { outputRootHelp } = await import("./cli/program/root-help.js");
-      await outputRootHelp();
-    }
+    const outputRootHelp =
+      deps.outputRootHelp ?? (await import("./cli/program/root-help.js")).outputRootHelp;
+    await outputRootHelp(liveRootHelpOptions ?? undefined);
     return true;
   } catch (error) {
     handleError(error);
@@ -196,8 +183,27 @@ export async function tryHandleRootHelpFastPath(
   }
 }
 
+export async function tryHandlePrecomputedCommandHelpFastPath(
+  argv: string[],
+  deps: PrecomputedCommandHelpDeps = {},
+): Promise<boolean> {
+  const env = deps.env ?? process.env;
+  if (resolveCliContainerTarget(argv, env)) {
+    return false;
+  }
+
+  try {
+    return await tryOutputPrecomputedCommandHelp(argv, { ...deps, env });
+  } catch {
+    return false;
+  }
+}
+
 async function runMainOrRootHelp(argv: string[]): Promise<void> {
   if (await tryHandleRootHelpFastPath(argv)) {
+    return;
+  }
+  if (await tryHandlePrecomputedCommandHelpFastPath(argv)) {
     return;
   }
   try {

@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+// Nextcloud Talk plugin module implements api credentials behavior.
+import { tryReadSecretFileSync } from "openclaw/plugin-sdk/secret-file-runtime";
 import { normalizeResolvedSecretInputString } from "./secret-input.js";
 
 export function resolveNextcloudTalkApiCredentials(params: {
@@ -23,8 +24,14 @@ export function resolveNextcloudTalkApiCredentials(params: {
     return undefined;
   }
   try {
-    const filePassword = readFileSync(params.apiPasswordFile, "utf-8").trim();
-    return filePassword ? { apiUser, apiPassword: filePassword } : undefined;
+    const fileValue = tryReadSecretFileSync(
+      params.apiPasswordFile,
+      "Nextcloud Talk API password",
+      // Existing apiPasswordFile paths may be symlinks or hardlinks. Keep that
+      // contract while gaining the shared credential size and pinned-read checks.
+      { rejectHardlinks: false },
+    );
+    return fileValue ? { apiUser, apiPassword: fileValue } : undefined;
   } catch {
     return undefined;
   }

@@ -1,11 +1,13 @@
+// OpenClaw runtime test setup installs runtime mocks and cleanup.
 import { afterAll, afterEach, beforeAll, vi } from "vitest";
 import type {
   ChannelId,
   ChannelOutboundAdapter,
   ChannelPlugin,
-} from "../src/channels/plugins/types.js";
+} from "../src/channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../src/config/config.js";
 import type { OutboundSendDeps } from "../src/infra/outbound/deliver.js";
+import { createEmptyPluginRegistry } from "../src/plugins/registry-empty.js";
 import type { PluginRegistry } from "../src/plugins/registry.js";
 import { installSharedTestSetup } from "./setup.shared.js";
 
@@ -29,8 +31,8 @@ type WorkerCleanupHelpers = {
   drainSessionWriteLockStateForTest: typeof import("../src/agents/session-write-lock.js").drainSessionWriteLockStateForTest;
   resetContextWindowCacheForTest: typeof import("../src/agents/context-runtime-state.js").resetContextWindowCacheForTest;
   resetFileLockStateForTest: typeof import("../src/infra/file-lock.js").resetFileLockStateForTest;
-  resetModelsJsonReadyCacheForTest: typeof import("../src/agents/models-config-state.js").resetModelsJsonReadyCacheForTest;
-  resetSessionWriteLockStateForTest: typeof import("../src/agents/session-write-lock.js").resetSessionWriteLockStateForTest;
+  resetModelsJsonReadyCacheForTest: typeof import("../src/agents/models-config-state.test-support.js").resetModelsJsonReadyCacheForTest;
+  resetSessionWriteLockStateForTest: typeof import("../src/agents/session-write-lock.test-support.js").resetSessionWriteLockStateForTest;
 };
 
 type ReplyToModeResolver = NonNullable<
@@ -67,32 +69,38 @@ function loadWorkerCleanupHelpers(): Promise<WorkerCleanupHelpers> {
   const globalState = globalThis as typeof globalThis & {
     [WORKER_CLEANUP_HELPERS]?: Promise<WorkerCleanupHelpers>;
   };
-  globalState[WORKER_CLEANUP_HELPERS] ??= Promise.all([
-    vi.importActual<typeof import("../src/agents/context-runtime-state.js")>(
-      "../src/agents/context-runtime-state.js",
-    ),
-    vi.importActual<typeof import("../src/agents/models-config-state.js")>(
-      "../src/agents/models-config-state.js",
-    ),
-    vi.importActual<typeof import("../src/agents/session-write-lock.js")>(
-      "../src/agents/session-write-lock.js",
-    ),
-    vi.importActual<typeof import("../src/config/sessions/store-cache.js")>(
-      "../src/config/sessions/store-cache.js",
-    ),
-    vi.importActual<typeof import("../src/config/sessions/store-writer-state.js")>(
-      "../src/config/sessions/store-writer-state.js",
-    ),
-    vi.importActual<typeof import("../src/infra/file-lock.js")>("../src/infra/file-lock.js"),
-  ]).then(
-    ([
+  globalState[WORKER_CLEANUP_HELPERS] ??= (async () => {
+    // The test-support facade reads the API installed by the real lock module at import time.
+    // Load that producer first so concurrent module evaluation cannot observe a missing API.
+    const sessionWriteLock = await vi.importActual<
+      typeof import("../src/agents/session-write-lock.js")
+    >("../src/agents/session-write-lock.js");
+    const [
       contextRuntimeState,
       modelsConfigState,
-      sessionWriteLock,
+      sessionWriteLockTestSupport,
       sessionStoreCache,
       sessionStoreWriterState,
       fileLock,
-    ]) => ({
+    ] = await Promise.all([
+      vi.importActual<typeof import("../src/agents/context-runtime-state.js")>(
+        "../src/agents/context-runtime-state.js",
+      ),
+      vi.importActual<typeof import("../src/agents/models-config-state.test-support.js")>(
+        "../src/agents/models-config-state.test-support.js",
+      ),
+      vi.importActual<typeof import("../src/agents/session-write-lock.test-support.js")>(
+        "../src/agents/session-write-lock.test-support.js",
+      ),
+      vi.importActual<typeof import("../src/config/sessions/store-cache.js")>(
+        "../src/config/sessions/store-cache.js",
+      ),
+      vi.importActual<typeof import("../src/config/sessions/store-writer-state.js")>(
+        "../src/config/sessions/store-writer-state.js",
+      ),
+      vi.importActual<typeof import("../src/infra/file-lock.js")>("../src/infra/file-lock.js"),
+    ]);
+    return {
       clearSessionStoreCaches: sessionStoreCache.clearSessionStoreCaches,
       drainFileLockStateForTest: fileLock.drainFileLockStateForTest,
       drainSessionStoreWriterQueuesForTest:
@@ -101,9 +109,10 @@ function loadWorkerCleanupHelpers(): Promise<WorkerCleanupHelpers> {
       resetContextWindowCacheForTest: contextRuntimeState.resetContextWindowCacheForTest,
       resetFileLockStateForTest: fileLock.resetFileLockStateForTest,
       resetModelsJsonReadyCacheForTest: modelsConfigState.resetModelsJsonReadyCacheForTest,
-      resetSessionWriteLockStateForTest: sessionWriteLock.resetSessionWriteLockStateForTest,
-    }),
-  );
+      resetSessionWriteLockStateForTest:
+        sessionWriteLockTestSupport.resetSessionWriteLockStateForTest,
+    };
+  })();
   return globalState[WORKER_CLEANUP_HELPERS];
 }
 
@@ -124,10 +133,7 @@ function createTestRegistryForSetup(
   channels: Array<{ pluginId: string; plugin: ChannelPlugin; source: string }> = [],
 ): PluginRegistry {
   return {
-    plugins: [],
-    tools: [],
-    hooks: [],
-    typedHooks: [],
+    ...createEmptyPluginRegistry(),
     channels: channels as unknown as PluginRegistry["channels"],
     channelSetups: channels.map((entry) => ({
       pluginId: entry.pluginId,
@@ -135,28 +141,6 @@ function createTestRegistryForSetup(
       source: entry.source,
       enabled: true,
     })),
-    providers: [],
-    speechProviders: [],
-    realtimeTranscriptionProviders: [],
-    realtimeVoiceProviders: [],
-    mediaUnderstandingProviders: [],
-    imageGenerationProviders: [],
-    videoGenerationProviders: [],
-    webFetchProviders: [],
-    webSearchProviders: [],
-    migrationProviders: [],
-    memoryEmbeddingProviders: [],
-    gatewayHandlers: {},
-    httpRoutes: [],
-    cliRegistrars: [],
-    reloads: [],
-    nodeHostCommands: [],
-    securityAuditCollectors: [],
-    services: [],
-    gatewayDiscoveryServices: [],
-    commands: [],
-    conversationBindingResolvedHandlers: [],
-    diagnostics: [],
   };
 }
 
@@ -203,8 +187,7 @@ const createStubOutbound = (
   sendText: async ({ deps, to, text }) => {
     const send = pickSendFn(id, deps);
     if (send) {
-      // oxlint-disable-next-line typescript/no-explicit-any
-      const result = (await send(to, text, { verbose: false } as any)) as {
+      const result = (await send(to, text, { verbose: false })) as {
         messageId: string;
       };
       return { channel: id, ...result };
@@ -214,8 +197,7 @@ const createStubOutbound = (
   sendMedia: async ({ deps, to, text, mediaUrl }) => {
     const send = pickSendFn(id, deps);
     if (send) {
-      // oxlint-disable-next-line typescript/no-explicit-any
-      const result = (await send(to, text, { verbose: false, mediaUrl } as any)) as {
+      const result = (await send(to, text, { verbose: false, mediaUrl })) as {
         messageId: string;
       };
       return { channel: id, ...result };
@@ -288,7 +270,9 @@ const createDefaultRegistry = () =>
       plugin: createStubPlugin({
         id: "discord",
         label: "Discord",
-        resolveReplyToMode: createTopLevelChannelReplyToModeResolverForTest("discord"),
+        resolveReplyToMode: createTopLevelChannelReplyToModeResolverForTest(
+          "discord",
+        ) as Parameters<typeof createStubPlugin>[0]["resolveReplyToMode"],
       }),
       source: "test",
     },
@@ -307,7 +291,9 @@ const createDefaultRegistry = () =>
         ...createStubPlugin({
           id: "telegram",
           label: "Telegram",
-          resolveReplyToMode: createTopLevelChannelReplyToModeResolverForTest("telegram"),
+          resolveReplyToMode: createTopLevelChannelReplyToModeResolverForTest(
+            "telegram",
+          ) as Parameters<typeof createStubPlugin>[0]["resolveReplyToMode"],
         }),
         status: {
           buildChannelSummary: async () => ({

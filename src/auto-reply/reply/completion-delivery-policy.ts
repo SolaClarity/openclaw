@@ -1,17 +1,21 @@
+// Resolves whether completed replies should send visibly or stay tool-only.
 import { normalizeChatType, type ChatType } from "../../channels/chat-type.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { deriveSessionChatType } from "../../sessions/session-chat-type.js";
+import { deriveSessionChatTypeFromKey } from "../../sessions/session-chat-type-shared.js";
 import type { DeliveryContext } from "../../utils/delivery-context.types.js";
+import type { SourceReplyDeliveryMode } from "../source-reply-delivery-mode.types.js";
 import { resolveSourceReplyDeliveryMode } from "./source-reply-delivery-mode.js";
 
-export type CompletionChatType = ChatType | "unknown";
+type CompletionChatType = ChatType | "unknown";
 
-export type CompletionDeliverySessionEntry = {
+type DurableCompletionDeliveryMode = "automatic" | "host_owned";
+
+type CompletionDeliverySessionEntry = {
   chatType?: string | null;
   origin?: { chatType?: string | null } | null;
 };
 
-export function resolveCompletionChatType(params: {
+function resolveCompletionChatType(params: {
   requesterSessionKey?: string | null;
   targetRequesterSessionKey?: string | null;
   requesterEntry?: CompletionDeliverySessionEntry;
@@ -26,7 +30,7 @@ export function resolveCompletionChatType(params: {
   }
 
   for (const key of [params.targetRequesterSessionKey, params.requesterSessionKey]) {
-    const derived = deriveSessionChatType(key);
+    const derived = deriveSessionChatTypeFromKey(key);
     if (derived !== "unknown") {
       return derived;
     }
@@ -57,10 +61,19 @@ export function completionRequiresMessageToolDelivery(params: {
   );
 }
 
+/** Resolve transport authority for a durable, fixed-route agent completion. */
+export function resolveDurableCompletionDeliveryMode(
+  sourceReplyDeliveryMode: SourceReplyDeliveryMode,
+): DurableCompletionDeliveryMode {
+  // Message-tool-only blocks ambient model replies. A durable completion is an
+  // explicit system send: the host fixes route/payload and withholds the message tool.
+  return sourceReplyDeliveryMode === "message_tool_only" ? "host_owned" : "automatic";
+}
+
 export function shouldRouteCompletionThroughRequesterSession(
   sessionKey: string | undefined | null,
 ): boolean {
-  const chatType = deriveSessionChatType(sessionKey);
+  const chatType = deriveSessionChatTypeFromKey(sessionKey);
   return chatType === "group" || chatType === "channel";
 }
 

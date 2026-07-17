@@ -1,3 +1,4 @@
+// Program route tests cover CLI route table registration and dispatch.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { defaultRuntime } from "../../runtime.js";
 import { findRoutedCommand } from "./routes.js";
@@ -53,7 +54,7 @@ vi.mock("../../commands/channels/status.js", () => ({
   channelsStatusCommand: channelsStatusCommandMock,
 }));
 
-vi.mock("../../commands/agents.js", () => ({
+vi.mock("../../commands/agents.commands.list.js", () => ({
   agentsListCommand: agentsListCommandMock,
 }));
 
@@ -519,6 +520,24 @@ describe("program routes", () => {
       { json: true, runtime: "cron", status: undefined },
       defaultRuntime,
     );
+
+    await expect(
+      listRoute.run([
+        "node",
+        "openclaw",
+        "tasks",
+        "list",
+        "--json",
+        "--runtime",
+        "   ",
+        "--status",
+        "\t",
+      ]),
+    ).resolves.toBe(true);
+    expect(tasksListJsonCommandMock).toHaveBeenLastCalledWith(
+      { json: true, runtime: "   ", status: "\t" },
+      defaultRuntime,
+    );
   });
 
   it("routes parent task filter values that command-path discovery sees as positionals", async () => {
@@ -583,6 +602,24 @@ describe("program routes", () => {
       { json: true, severity: "error", code: "stale_running", limit: 5 },
       defaultRuntime,
     );
+
+    await expect(
+      route.run([
+        "node",
+        "openclaw",
+        "tasks",
+        "audit",
+        "--json",
+        "--severity",
+        "  ",
+        "--code",
+        "\t",
+      ]),
+    ).resolves.toBe(true);
+    expect(tasksAuditJsonCommandMock).toHaveBeenLastCalledWith(
+      { json: true, severity: "  ", code: "\t", limit: undefined },
+      defaultRuntime,
+    );
   });
 
   it("returns false for task JSON routes when option values are missing or unknown", async () => {
@@ -591,6 +628,10 @@ describe("program routes", () => {
     await expectRunFalse(
       ["tasks", "audit"],
       ["node", "openclaw", "tasks", "audit", "--json", "--limit"],
+    );
+    await expectRunFalse(
+      ["tasks", "audit"],
+      ["node", "openclaw", "tasks", "audit", "--json", "--limit", "5abc"],
     );
     await expectRunFalse(
       ["tasks", "audit"],

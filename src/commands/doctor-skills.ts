@@ -1,54 +1,22 @@
+/** Doctor checks and repair prompts for unavailable configured skills. */
 import { existsSync } from "node:fs";
+import { note } from "../../packages/terminal-core/src/note.js";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
-import type { SkillStatusEntry, SkillStatusReport } from "../agents/skills-status.js";
-import { buildWorkspaceSkillStatus } from "../agents/skills-status.js";
+import { formatCliCommand } from "../cli/command-format.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { SkillStatusEntry } from "../skills/discovery/status.js";
+import { buildWorkspaceSkillStatus } from "../skills/discovery/status.js";
 import {
   detectGhConfigDirMismatch,
   formatGhConfigDirMismatchHint,
   type GhConfigDiscoveryInput,
   type GhConfigDiscoveryResult,
-} from "../agents/skills/gh-config-discovery.js";
-import { formatCliCommand } from "../cli/command-format.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { note } from "../terminal/note.js";
+} from "../skills/lifecycle/gh-config-discovery.js";
 import type { DoctorPrompter } from "./doctor-prompter.js";
-
-export function collectUnavailableAgentSkills(report: SkillStatusReport): SkillStatusEntry[] {
-  return report.skills.filter(
-    (skill) =>
-      !skill.eligible &&
-      !skill.disabled &&
-      !skill.blockedByAllowlist &&
-      !skill.blockedByAgentFilter,
-  );
-}
-
-function formatMissingSummary(skill: SkillStatusEntry): string {
-  const missing: string[] = [];
-  if (skill.missing.bins.length > 0) {
-    missing.push(`bins: ${skill.missing.bins.join(", ")}`);
-  }
-  if (skill.missing.anyBins.length > 0) {
-    missing.push(`any bins: ${skill.missing.anyBins.join(", ")}`);
-  }
-  if (skill.missing.env.length > 0) {
-    missing.push(`env: ${skill.missing.env.join(", ")}`);
-  }
-  if (skill.missing.config.length > 0) {
-    missing.push(`config: ${skill.missing.config.join(", ")}`);
-  }
-  if (skill.missing.os.length > 0) {
-    missing.push(`os: ${skill.missing.os.join(", ")}`);
-  }
-  return missing.join("; ") || "unknown requirement";
-}
-
-function formatInstallHints(skill: SkillStatusEntry): string[] {
-  if (skill.install.length === 0) {
-    return [];
-  }
-  return skill.install.slice(0, 2).map((entry) => `  install option: ${entry.label}`);
-}
+import {
+  collectUnavailableAgentSkills,
+  disableUnavailableSkillsInConfig,
+} from "./doctor-skills-core.js";
 
 function defaultGhConfigDiscoveryInput(): GhConfigDiscoveryInput {
   return {
@@ -58,11 +26,13 @@ function defaultGhConfigDiscoveryInput(): GhConfigDiscoveryInput {
   };
 }
 
-export function describeGhConfigDirHint(skills: SkillStatusEntry[]): string[] {
+/** Builds a GitHub CLI config-dir hint for eligible GitHub skill setups. */
+function describeGhConfigDirHint(skills: SkillStatusEntry[]): string[] {
   return describeGhConfigDirHintFromDiscovery(skills, defaultGhConfigDiscoveryInput());
 }
 
-export function describeGhConfigDirHintFromDiscovery(
+/** Builds a GitHub CLI config-dir hint from injected discovery inputs for tests. */
+function describeGhConfigDirHintFromDiscovery(
   skills: SkillStatusEntry[],
   discoveryInput: GhConfigDiscoveryInput,
 ): string[] {
@@ -85,14 +55,16 @@ export function describeGhConfigDirHintFromDiscovery(
   return formatGhConfigDirMismatchHint(result);
 }
 
-export function formatUnavailableSkillDoctorLines(skills: SkillStatusEntry[]): string[] {
-  const lines: string[] = [
-    "Some skills are allowed for this agent but are not usable in the current runtime environment.",
+/** Formats doctor note lines for skills that are allowed but unavailable. */
+function formatUnavailableSkillDoctorLines(skills: SkillStatusEntry[]): string[] {
+  const count = skills.length;
+  const lines = [
+    `${count} allowed skill${count === 1 ? " is" : "s are"} not usable in this environment (missing binaries, env vars, or config).`,
+    `- ${skills
+      .map((skill) => skill.name)
+      .toSorted((a, b) => a.localeCompare(b))
+      .join(", ")}`,
   ];
-  for (const skill of skills) {
-    lines.push(`- ${skill.name}: ${formatMissingSummary(skill)}`);
-    lines.push(...formatInstallHints(skill));
-  }
   lines.push(`Disable unused skills: ${formatCliCommand("openclaw doctor --fix")}`);
   lines.push(
     `Inspect details: ${formatCliCommand("openclaw skills check --agent <id>")} or ${formatCliCommand("openclaw skills info <name> --agent <id>")}`,
@@ -100,29 +72,7 @@ export function formatUnavailableSkillDoctorLines(skills: SkillStatusEntry[]): s
   return lines;
 }
 
-export function disableUnavailableSkillsInConfig(
-  config: OpenClawConfig,
-  skills: readonly SkillStatusEntry[],
-): OpenClawConfig {
-  if (skills.length === 0) {
-    return config;
-  }
-  const entries = { ...config.skills?.entries };
-  for (const skill of skills) {
-    entries[skill.skillKey] = {
-      ...entries[skill.skillKey],
-      enabled: false,
-    };
-  }
-  return {
-    ...config,
-    skills: {
-      ...config.skills,
-      entries,
-    },
-  };
-}
-
+/** Checks default-agent skill readiness and optionally disables unavailable skills in config. */
 export async function maybeRepairSkillReadiness(params: {
   cfg: OpenClawConfig;
   prompter: DoctorPrompter;

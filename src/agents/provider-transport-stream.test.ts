@@ -1,4 +1,5 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
+// Verifies transport-aware model stream aliases and fail-closed boundaries.
+import type { Api, Model } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it } from "vitest";
 import { attachModelProviderLocalService } from "./provider-local-service.js";
 import { attachModelProviderRequestTransport } from "./provider-request-config.js";
@@ -7,7 +8,6 @@ import {
   createBoundaryAwareStreamFnForModel,
   createOpenClawTransportStreamFnForModel,
   createTransportAwareStreamFnForModel,
-  isTransportAwareApiSupported,
   prepareTransportAwareSimpleModel,
   resolveTransportAwareSimpleApi,
 } from "./provider-transport-stream.js";
@@ -20,6 +20,7 @@ function buildModel<TApi extends Api>(
     baseUrl: string;
   },
 ): Model<TApi> {
+  // Minimal model rows keep the transport matrix focused on api/provider/baseUrl.
   return {
     id: params.id,
     name: params.id,
@@ -36,6 +37,7 @@ function buildModel<TApi extends Api>(
 
 describe("provider transport stream contracts", () => {
   it("covers the supported transport api alias matrix", () => {
+    // Supported APIs can be projected to OpenClaw transport aliases when needed.
     const cases = [
       {
         api: "openai-responses" as const,
@@ -45,8 +47,8 @@ describe("provider transport stream contracts", () => {
         alias: "openclaw-openai-responses-transport",
       },
       {
-        api: "openai-codex-responses" as const,
-        provider: "openai-codex",
+        api: "openai-chatgpt-responses" as const,
+        provider: "openai",
         id: "codex-mini-latest",
         baseUrl: "https://chatgpt.com/backend-api",
         alias: "openclaw-openai-responses-transport",
@@ -97,7 +99,6 @@ describe("provider transport stream contracts", () => {
         },
       );
 
-      expect(isTransportAwareApiSupported(testCase.api)).toBe(true);
       expect(resolveTransportAwareSimpleApi(testCase.api)).toBe(testCase.alias);
       if (testCase.providerOwnedRuntime) {
         continue;
@@ -127,7 +128,6 @@ describe("provider transport stream contracts", () => {
       },
     );
 
-    expect(isTransportAwareApiSupported(model.api)).toBe(false);
     expect(resolveTransportAwareSimpleApi(model.api)).toBeUndefined();
     expect(createBoundaryAwareStreamFnForModel(model)).toBeUndefined();
     expect(() => createTransportAwareStreamFnForModel(model)).toThrow(
@@ -197,10 +197,10 @@ describe("provider transport stream contracts", () => {
     expect(preparedModel.id).toBe("google/gemma-4-E2B-it");
   });
 
-  it("keeps Codex defaults on the OpenClaw transport until PI preserves attribution", () => {
-    const model = buildModel("openai-codex-responses", {
+  it("keeps Codex defaults on the OpenClaw transport until OpenClaw preserves attribution", () => {
+    const model = buildModel("openai-chatgpt-responses", {
       id: "gpt-5.4",
-      provider: "openai-codex",
+      provider: "openai",
       baseUrl: "https://chatgpt.com/backend-api",
     });
 

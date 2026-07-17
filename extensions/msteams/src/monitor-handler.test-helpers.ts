@@ -1,10 +1,13 @@
+// Msteams helper module supports monitor handler helpers behavior.
+import type { PreparedInboundReply } from "openclaw/plugin-sdk/channel-inbound";
 import { vi } from "vitest";
 import type { OpenClawConfig, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
 import type { MSTeamsConversationStore } from "./conversation-store.js";
-import type { MSTeamsAdapter } from "./messenger.js";
-import type { MSTeamsActivityHandler, MSTeamsMessageHandlerDeps } from "./monitor-handler.js";
+import type { MSTeamsActivityHandler } from "./monitor-handler.js";
+import type { MSTeamsMessageHandlerDeps } from "./monitor-handler.types.js";
 import type { MSTeamsPollStore } from "./polls.js";
 import { setMSTeamsRuntime } from "./runtime.js";
+import type { MSTeamsApp } from "./sdk.js";
 
 type RuntimeRoutePeer = { peer: { kind: string; id: string } };
 
@@ -15,33 +18,38 @@ type MSTeamsTestRuntimeOptions = {
   recordInboundSession?: ReturnType<typeof vi.fn>;
   resolveAgentRoute?: (params: RuntimeRoutePeer) => unknown;
   hasControlCommand?: PluginRuntime["channel"]["text"]["hasControlCommand"];
+  isControlCommandMessage?: PluginRuntime["channel"]["commands"]["isControlCommandMessage"];
+  shouldComputeCommandAuthorized?: PluginRuntime["channel"]["commands"]["shouldComputeCommandAuthorized"];
+  shouldHandleTextCommands?: PluginRuntime["channel"]["commands"]["shouldHandleTextCommands"];
+  createInboundDebouncer?: PluginRuntime["channel"]["debounce"]["createInboundDebouncer"];
+  resolveInboundDebounceMs?: PluginRuntime["channel"]["debounce"]["resolveInboundDebounceMs"];
   resolveTextChunkLimit?: () => number;
   resolveStorePath?: () => string;
 };
 
 export function installMSTeamsTestRuntime(options: MSTeamsTestRuntimeOptions = {}): void {
-  const runPrepared = vi.fn(
-    async (turn: Parameters<PluginRuntime["channel"]["turn"]["runPrepared"]>[0]) => {
-      await turn.recordInboundSession({
-        storePath: turn.storePath,
-        sessionKey: turn.ctxPayload.SessionKey ?? turn.routeSessionKey,
-        ctx: turn.ctxPayload,
-        groupResolution: turn.record?.groupResolution,
-        createIfMissing: turn.record?.createIfMissing,
-        updateLastRoute: turn.record?.updateLastRoute,
-        onRecordError: turn.record?.onRecordError ?? (() => undefined),
-      });
-      const dispatchResult = await turn.runDispatch();
-      return {
-        admission: { kind: "dispatch" as const },
-        dispatched: true,
-        ctxPayload: turn.ctxPayload,
-        routeSessionKey: turn.routeSessionKey,
-        dispatchResult,
-      };
-    },
-  );
-  const run = vi.fn(async (params: Parameters<PluginRuntime["channel"]["turn"]["run"]>[0]) => {
+  const recordInboundSession = options.recordInboundSession ?? vi.fn(async () => undefined);
+  const resolveStorePath = options.resolveStorePath ?? (() => "/tmp/msteams-sessions.json");
+  const runPrepared = vi.fn(async (turn: PreparedInboundReply<unknown>) => {
+    await turn.recordInboundSession({
+      storePath: turn.storePath,
+      sessionKey: turn.ctxPayload.SessionKey ?? turn.routeSessionKey,
+      ctx: turn.ctxPayload,
+      groupResolution: turn.record?.groupResolution,
+      createIfMissing: turn.record?.createIfMissing,
+      updateLastRoute: turn.record?.updateLastRoute,
+      onRecordError: turn.record?.onRecordError ?? (() => undefined),
+    });
+    const dispatchResult = await turn.runDispatch();
+    return {
+      admission: { kind: "dispatch" as const },
+      dispatched: true,
+      ctxPayload: turn.ctxPayload,
+      routeSessionKey: turn.routeSessionKey,
+      dispatchResult,
+    };
+  });
+  const run = vi.fn(async (params: Parameters<PluginRuntime["channel"]["inbound"]["run"]>[0]) => {
     const input = await params.adapter.ingest(params.raw);
     if (!input) {
       return { admission: { kind: "drop" as const, reason: "ingest-null" }, dispatched: false };
@@ -57,7 +65,16 @@ export function installMSTeamsTestRuntime(options: MSTeamsTestRuntimeOptions = {
         : (preflightResult ?? {});
     const turn = await params.adapter.resolveTurn(input, eventClass, preflight);
     if ("runDispatch" in turn) {
-      return await runPrepared(turn);
+      const preparedTurn =
+        "route" in turn
+          ? ({
+              ...turn,
+              routeSessionKey: turn.route.sessionKey,
+              storePath: resolveStorePath(),
+              recordInboundSession,
+            } as PreparedInboundReply<unknown>)
+          : turn;
+      return await runPrepared(preparedTurn);
     }
     throw new Error("msteams test runtime only supports prepared turn dispatch");
   });
@@ -66,18 +83,29 @@ export function installMSTeamsTestRuntime(options: MSTeamsTestRuntimeOptions = {
     system: { enqueueSystemEvent: options.enqueueSystemEvent ?? vi.fn() },
     channel: {
       debounce: {
-        resolveInboundDebounceMs: () => 0,
-        createInboundDebouncer: <T>(params: {
-          onFlush: (entries: T[]) => Promise<void>;
-        }): { enqueue: (entry: T) => Promise<void> } => ({
-          enqueue: async (entry: T) => {
-            await params.onFlush([entry]);
-          },
-        }),
+        resolveInboundDebounceMs:
+          options.resolveInboundDebounceMs ??
+          ((() => 0) as PluginRuntime["channel"]["debounce"]["resolveInboundDebounceMs"]),
+        createInboundDebouncer:
+          options.createInboundDebouncer ??
+          (<T>(params: {
+            onFlush: (entries: T[]) => Promise<void>;
+          }): { enqueue: (entry: T) => Promise<void> } => ({
+            enqueue: async (entry: T) => {
+              await params.onFlush([entry]);
+            },
+          })),
       },
       pairing: {
         readAllowFromStore: options.readAllowFromStore ?? vi.fn(async () => []),
         upsertPairingRequest: options.upsertPairingRequest ?? vi.fn(async () => null),
+      },
+      commands: {
+        isControlCommandMessage:
+          options.isControlCommandMessage ?? options.hasControlCommand ?? (() => false),
+        shouldComputeCommandAuthorized:
+          options.shouldComputeCommandAuthorized ?? options.hasControlCommand ?? (() => false),
+        shouldHandleTextCommands: options.shouldHandleTextCommands ?? (() => true),
       },
       text: {
         hasControlCommand: options.hasControlCommand ?? (() => false),
@@ -107,12 +135,11 @@ export function installMSTeamsTestRuntime(options: MSTeamsTestRuntimeOptions = {
         resolveHumanDelayConfig: () => undefined,
       },
       session: {
-        recordInboundSession: options.recordInboundSession ?? vi.fn(async () => undefined),
-        ...(options.resolveStorePath ? { resolveStorePath: options.resolveStorePath } : {}),
+        recordInboundSession,
+        resolveStorePath,
       },
-      turn: {
-        run: run as unknown as PluginRuntime["channel"]["turn"]["run"],
-        runPrepared: runPrepared as unknown as PluginRuntime["channel"]["turn"]["runPrepared"],
+      inbound: {
+        run: run as unknown as PluginRuntime["channel"]["inbound"]["run"],
       },
     },
   } as unknown as PluginRuntime);
@@ -123,10 +150,9 @@ export function createActivityHandler(
 ): MSTeamsActivityHandler & {
   run: NonNullable<MSTeamsActivityHandler["run"]>;
 } {
-  let handler: MSTeamsActivityHandler & {
+  const handler: MSTeamsActivityHandler & {
     run: NonNullable<MSTeamsActivityHandler["run"]>;
-  };
-  handler = {
+  } = {
     onMessage: () => handler,
     onMembersAdded: () => handler,
     onReactionsAdded: () => handler,
@@ -140,19 +166,23 @@ export function createMSTeamsMessageHandlerDeps(params?: {
   cfg?: OpenClawConfig;
   runtime?: RuntimeEnv;
 }): MSTeamsMessageHandlerDeps {
-  const adapter: MSTeamsAdapter = {
-    continueConversation: async () => {},
-    process: async () => {},
-    updateActivity: async () => {},
-    deleteActivity: async () => {},
-  };
+  const app = {
+    tokenManager: {
+      getBotToken: async () => ({ toString: () => "bot-token" }),
+      getGraphToken: async () => ({ toString: () => "graph-token" }),
+    },
+    api: {},
+    graph: {},
+    send: async () => ({ id: "sent" }),
+    initialize: async () => {},
+    on: () => {},
+  } as unknown as MSTeamsApp;
   const conversationStore: MSTeamsConversationStore = {
     upsert: async () => {},
     get: async () => null,
     list: async () => [],
     remove: async () => false,
     findPreferredDmByUserId: async () => null,
-    findByUserId: async () => null,
   };
   const pollStore: MSTeamsPollStore = {
     createPoll: async () => {},
@@ -164,7 +194,7 @@ export function createMSTeamsMessageHandlerDeps(params?: {
     cfg: params?.cfg ?? {},
     runtime: (params?.runtime ?? { error: vi.fn() }) as RuntimeEnv,
     appId: "test-app-id",
-    adapter,
+    app,
     tokenProvider: {
       getAccessToken: async () => "token",
     },

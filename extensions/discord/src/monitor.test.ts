@@ -1,3 +1,4 @@
+// Discord tests cover monitor plugin behavior.
 import { danger } from "openclaw/plugin-sdk/runtime-env";
 import { typedCases } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -1420,3 +1421,4 @@ describe("discord reaction notification modes", () => {
     }
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

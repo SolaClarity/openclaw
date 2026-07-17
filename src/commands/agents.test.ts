@@ -1,13 +1,9 @@
+// Agents command tests cover agent config mutation, binding updates, and summary generation.
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import {
-  applyAgentBindings,
-  applyAgentConfig,
-  buildAgentSummaries,
-  pruneAgentConfig,
-  removeAgentBindings,
-} from "./agents.js";
+import { applyAgentBindings, removeAgentBindings } from "./agents.bindings.js";
+import { applyAgentConfig, buildAgentSummaries, pruneAgentConfig } from "./agents.config.js";
 
 function requireAgentSummary(
   summaries: ReturnType<typeof buildAgentSummaries>,
@@ -84,6 +80,23 @@ describe("agents helpers", () => {
     expect(work?.workspace).toBe("/new-ws");
     expect(work?.agentDir).toBe("/state/work/agent");
     expect(work?.model).toBe("anthropic/claude");
+  });
+
+  it("applyAgentConfig clears a model override", () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        defaults: { model: { primary: "openai/gpt-5.6-luna" } },
+        list: [{ id: "work", workspace: "/work-ws", model: "anthropic/claude" }],
+      },
+    };
+
+    const next = applyAgentConfig(cfg, { agentId: "work", model: null });
+    const work = next.agents?.list?.find((agent) => agent.id === "work");
+
+    expect(work).not.toHaveProperty("model");
+    expect(requireAgentSummary(buildAgentSummaries(next), "work").model).toBe(
+      "openai/gpt-5.6-luna",
+    );
   });
 
   it("applyAgentConfig merges identity with existing", () => {

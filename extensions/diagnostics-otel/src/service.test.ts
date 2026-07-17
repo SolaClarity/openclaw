@@ -1,6 +1,15 @@
+// Diagnostics Otel tests cover service plugin behavior.
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const telemetryState = vi.hoisted(() => {
+  type TestSpanContext = {
+    traceId: string;
+    spanId: string;
+    traceFlags: number;
+  };
   const counters = new Map<string, { add: ReturnType<typeof vi.fn> }>();
   const histograms = new Map<string, { record: ReturnType<typeof vi.fn> }>();
   const spans: Array<{
@@ -9,7 +18,7 @@ const telemetryState = vi.hoisted(() => {
     end: ReturnType<typeof vi.fn>;
     setAttributes: ReturnType<typeof vi.fn>;
     setStatus: ReturnType<typeof vi.fn>;
-    spanContext: ReturnType<typeof vi.fn>;
+    spanContext: ReturnType<typeof vi.fn<() => TestSpanContext>>;
   }> = [];
   const tracer = {
     startSpan: vi.fn((name: string, _opts?: unknown, _ctx?: unknown) => {
@@ -20,7 +29,7 @@ const telemetryState = vi.hoisted(() => {
         end: vi.fn(),
         setAttributes: vi.fn(),
         setStatus: vi.fn(),
-        spanContext: vi.fn(() => ({
+        spanContext: vi.fn<() => TestSpanContext>(() => ({
           traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
           spanId,
           traceFlags: 1,
@@ -53,6 +62,24 @@ const logShutdown = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const traceExporterCtor = vi.hoisted(() => vi.fn());
 const metricExporterCtor = vi.hoisted(() => vi.fn());
 const logExporterCtor = vi.hoisted(() => vi.fn());
+const spanProcessorCtor = vi.hoisted(() => vi.fn());
+const nodeProxyAgent = vi.hoisted(() => ({ kind: "node-proxy-agent" }));
+const createNodeProxyAgentMock = vi.hoisted(() => vi.fn());
+const unhandledRejectionHandlerState = vi.hoisted(() => {
+  let handlers: Array<(reason: unknown) => boolean> = [];
+  return {
+    getHandlers: () => handlers,
+    register: vi.fn((handler: (reason: unknown) => boolean) => {
+      handlers.push(handler);
+      return () => {
+        handlers = handlers.filter((candidate) => candidate !== handler);
+      };
+    }),
+    reset: () => {
+      handlers = [];
+    },
+  };
+});
 
 vi.mock("@opentelemetry/api", () => ({
   context: {
@@ -71,6 +98,9 @@ vi.mock("@opentelemetry/api", () => ({
   },
   SpanStatusCode: {
     ERROR: 2,
+  },
+  SpanKind: {
+    CLIENT: 2,
   },
 }));
 
@@ -99,6 +129,14 @@ vi.mock("@opentelemetry/exporter-logs-otlp-proto", () => ({
   },
 }));
 
+vi.mock("openclaw/plugin-sdk/runtime-env", () => ({
+  registerUnhandledRejectionHandler: unhandledRejectionHandlerState.register,
+}));
+
+vi.mock("openclaw/plugin-sdk/fetch-runtime", () => ({
+  createNodeProxyAgent: createNodeProxyAgentMock,
+}));
+
 vi.mock("@opentelemetry/sdk-logs", () => ({
   BatchLogRecordProcessor: function BatchLogRecordProcessor() {},
   LoggerProvider: class {
@@ -114,6 +152,9 @@ vi.mock("@opentelemetry/sdk-metrics", () => ({
 }));
 
 vi.mock("@opentelemetry/sdk-trace-base", () => ({
+  BatchSpanProcessor: function BatchSpanProcessor(exporter?: unknown, options?: unknown) {
+    spanProcessorCtor(exporter, options);
+  },
   ParentBasedSampler: function ParentBasedSampler() {},
   TraceIdRatioBasedSampler: function TraceIdRatioBasedSampler() {},
 }));
@@ -130,10 +171,23 @@ vi.mock("@opentelemetry/semantic-conventions", () => ({
 }));
 
 import {
+  createDiagnosticTraceContext,
   emitTrustedDiagnosticEvent,
+  emitTrustedDiagnosticEventWithPrivateData,
   onInternalDiagnosticEvent,
   resetDiagnosticEventsForTest,
+  waitForDiagnosticEventsDrained,
+  type DiagnosticEventPrivateData,
 } from "openclaw/plugin-sdk/diagnostic-runtime";
+import {
+  emitDiagnosticEventWithTrustedTraceContext,
+  emitInternalDiagnosticEventForTest,
+  emitTrustedSecurityEvent,
+  logMessageDispatchStarted,
+  logMessageProcessed,
+  onTrustedInternalDiagnosticEvent,
+  runWithDiagnosticTraceContext,
+} from "openclaw/plugin-sdk/plugin-test-runtime";
 import type { OpenClawPluginServiceContext } from "../api.js";
 import { emitDiagnosticEvent } from "../api.js";
 import { createDiagnosticsOtelService } from "./service.js";
@@ -146,8 +200,14 @@ const SPAN_ID = "00f067aa0ba902b7";
 const CHILD_SPAN_ID = "1111111111111111";
 const GRANDCHILD_SPAN_ID = "2222222222222222";
 const TOOL_SPAN_ID = "3333333333333333";
+const MODEL_CALL_SPAN_ID = "4444444444444444";
+const MODEL_USAGE_SPAN_ID = "5555555555555555";
+
+function numberedSpanId(index: number) {
+  return (index + 0x1000).toString(16).padStart(16, "0");
+}
 const PROTO_KEY = "__proto__";
-const MAX_TEST_OTEL_CONTENT_ATTRIBUTE_CHARS = 4096;
+const MAX_TEST_OTEL_CONTENT_ATTRIBUTE_CHARS = 128 * 1024;
 const OTEL_TRUNCATED_SUFFIX_MAX_CHARS = 20;
 const ORIGINAL_OPENCLAW_OTEL_PRELOADED = process.env.OPENCLAW_OTEL_PRELOADED;
 const ORIGINAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
@@ -155,6 +215,23 @@ const ORIGINAL_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT =
   process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT;
 const ORIGINAL_OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
 const ORIGINAL_OTEL_SEMCONV_STABILITY_OPT_IN = process.env.OTEL_SEMCONV_STABILITY_OPT_IN;
+const OTEL_CERT_ENV_KEYS = [
+  "OTEL_EXPORTER_OTLP_CERTIFICATE",
+  "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+  "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+  "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+  "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+  "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+  "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+  "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+  "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+  "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+  "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+  "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+] as const;
+const ORIGINAL_OTEL_CERT_ENV = Object.fromEntries(
+  OTEL_CERT_ENV_KEYS.map((key) => [key, process.env[key]]),
+) as Record<(typeof OTEL_CERT_ENV_KEYS)[number], string | undefined>;
 
 function createLogger() {
   return {
@@ -169,13 +246,26 @@ type OtelContextFlags = {
   traces?: boolean;
   metrics?: boolean;
   logs?: boolean;
+  protocol?: NonNullable<
+    NonNullable<OpenClawPluginServiceContext["config"]["diagnostics"]>["otel"]
+  >["protocol"];
+  logsExporter?: NonNullable<
+    NonNullable<OpenClawPluginServiceContext["config"]["diagnostics"]>["otel"]
+  >["logsExporter"];
   captureContent?: NonNullable<
     NonNullable<OpenClawPluginServiceContext["config"]["diagnostics"]>["otel"]
   >["captureContent"];
 };
 function createOtelContext(
   endpoint: string,
-  { traces = false, metrics = false, logs = false, captureContent }: OtelContextFlags = {},
+  {
+    traces = false,
+    metrics = false,
+    logs = false,
+    protocol = OTEL_TEST_PROTOCOL,
+    logsExporter,
+    captureContent,
+  }: OtelContextFlags = {},
 ): OpenClawPluginServiceContext {
   return {
     config: {
@@ -184,10 +274,11 @@ function createOtelContext(
         otel: {
           enabled: true,
           endpoint,
-          protocol: OTEL_TEST_PROTOCOL,
+          protocol,
           traces,
           metrics,
           logs,
+          ...(logsExporter !== undefined ? { logsExporter } : {}),
           ...(captureContent !== undefined ? { captureContent } : {}),
         },
       },
@@ -195,8 +286,8 @@ function createOtelContext(
     logger: createLogger(),
     stateDir: OTEL_TEST_STATE_DIR,
     internalDiagnostics: {
-      emit: emitTrustedDiagnosticEvent,
-      onEvent: onInternalDiagnosticEvent,
+      emit: emitTrustedDiagnosticEventWithPrivateData,
+      onEvent: onTrustedInternalDiagnosticEvent,
     },
   };
 }
@@ -207,13 +298,38 @@ function createTraceOnlyContext(endpoint: string): OpenClawPluginServiceContext 
 
 function startedSpanCall(name: string) {
   const calls = telemetryState.tracer.startSpan.mock.calls as unknown as Array<
-    [string, { attributes?: Record<string, unknown>; startTime?: unknown }?, unknown?]
+    [
+      string,
+      { attributes?: Record<string, unknown>; kind?: unknown; startTime?: unknown }?,
+      unknown?,
+    ]
   >;
   return calls.find(([spanName]) => spanName === name);
 }
 
 function startedSpanOptions(name: string) {
   return startedSpanCall(name)?.[1];
+}
+
+function startedSpanParentContexts(name: string) {
+  return telemetryState.tracer.startSpan.mock.calls
+    .filter((call) => call[0] === name)
+    .map(
+      (call) =>
+        (call[2] as { spanContext?: { traceId?: string; spanId?: string } } | undefined)
+          ?.spanContext,
+    );
+}
+
+function startedSpanParentContextsByName(name: string) {
+  return telemetryState.tracer.startSpan.mock.calls
+    .filter((call) => call[0] === name)
+    .map((call) => ({
+      attributes: (call[1] as { attributes?: Record<string, unknown> } | undefined)?.attributes,
+      parentContext: (
+        call[2] as { spanContext?: { traceId?: string; spanId?: string } } | undefined
+      )?.spanContext,
+    }));
 }
 
 function mockCall(mock: { mock: { calls: unknown[][] } }, callIndex = 0): unknown[] {
@@ -228,8 +344,50 @@ function mockCallArg(mock: { mock: { calls: unknown[][] } }, argIndex: number, c
   return mockCall(mock, callIndex)[argIndex];
 }
 
-function firstExporterOptions(mock: { mock: { calls: unknown[][] } }): { url?: string } {
-  return mockCallArg(mock, 0) as { url?: string };
+type TestExporterOptions = {
+  url?: string;
+  httpAgentOptions?: (protocol: string) => unknown;
+};
+
+function firstExporterOptions(mock: { mock: { calls: unknown[][] } }): TestExporterOptions {
+  return mockCallArg(mock, 0) as TestExporterOptions;
+}
+
+function createNodeProxyAgentCalls(): Array<{
+  mode?: string;
+  targetUrl?: string;
+  agentOptions?: {
+    keepAlive?: boolean;
+    ca?: Buffer;
+    cert?: Buffer;
+    key?: Buffer;
+  };
+}> {
+  return createNodeProxyAgentMock.mock.calls.map(
+    ([options]) =>
+      options as {
+        mode?: string;
+        targetUrl?: string;
+        agentOptions?: {
+          keepAlive?: boolean;
+          ca?: Buffer;
+          cert?: Buffer;
+          key?: Buffer;
+        };
+      },
+  );
+}
+
+function findCreateNodeProxyAgentCall(targetUrl: string) {
+  const call = createNodeProxyAgentCalls().find((candidate) => candidate.targetUrl === targetUrl);
+  if (!call) {
+    throw new Error(`Expected createNodeProxyAgent call for ${targetUrl}`);
+  }
+  return call;
+}
+
+function firstSpanProcessorOptions(): { scheduledDelayMillis?: number } {
+  return mockCallArg(spanProcessorCtor, 1) as { scheduledDelayMillis?: number };
 }
 
 function firstSetSpanContext(): Record<string, unknown> {
@@ -246,6 +404,12 @@ function spanByName(name: string): (typeof telemetryState.spans)[number] {
 
 function firstSpanAttributes(name: string): Record<string, unknown> {
   return mockCallArg(spanByName(name).setAttributes, 0) as Record<string, unknown>;
+}
+
+function stringAttribute(attrs: Record<string, unknown> | undefined, key: string): string {
+  const value = attrs?.[key];
+  expect(value).toEqual(expect.any(String));
+  return value as string;
 }
 
 function firstSpanEndTime(name: string): unknown {
@@ -276,14 +440,57 @@ function histogramCreateOptions(name: string) {
     | undefined;
 }
 
+type StdoutDiagnosticLogLine = {
+  ts?: string;
+  signal?: string;
+  "service.name"?: string;
+  severityText?: string;
+  severityNumber?: number;
+  body?: unknown;
+  attributes?: Record<string, unknown>;
+  trace_id?: string;
+  span_id?: string;
+  trace_flags?: string;
+};
+
+function captureStdoutWrites() {
+  const writes: string[] = [];
+  const spy = vi.spyOn(process.stdout, "write").mockImplementation(((
+    chunk: string | Uint8Array,
+  ) => {
+    writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  }) as typeof process.stdout.write);
+  return { writes, spy };
+}
+
+function parseSingleStdoutDiagnosticLogLine(writes: string[]): StdoutDiagnosticLogLine {
+  expect(writes).toHaveLength(1);
+  expect(writes[0]?.endsWith("\n")).toBe(true);
+  const line = writes[0]?.slice(0, -1) ?? "";
+  expect(line).not.toContain("\n");
+  return JSON.parse(line) as StdoutDiagnosticLogLine;
+}
+
 async function emitAndCaptureLog(
   event: Omit<Extract<Parameters<typeof emitDiagnosticEvent>[0], { type: "log.record" }>, "type">,
-  options: { trusted?: boolean } = {},
+  options: {
+    captureContent?: OtelContextFlags["captureContent"];
+    trusted?: boolean;
+    trustedTraceContext?: boolean;
+  } = {},
 ) {
   const service = createDiagnosticsOtelService();
-  const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { logs: true });
+  const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+    logs: true,
+    ...(options.captureContent !== undefined ? { captureContent: options.captureContent } : {}),
+  });
   await service.start(ctx);
-  const emit = options.trusted ? emitTrustedDiagnosticEvent : emitDiagnosticEvent;
+  const emit = options.trusted
+    ? emitTrustedDiagnosticEvent
+    : options.trustedTraceContext
+      ? emitDiagnosticEventWithTrustedTraceContext
+      : emitDiagnosticEvent;
   emit({
     type: "log.record",
     ...event,
@@ -300,7 +507,41 @@ async function emitAndCaptureLog(
 }
 
 function flushDiagnosticEvents() {
-  return new Promise<void>((resolve) => setImmediate(resolve));
+  return new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+function emitTrustedModelCallCompletedWithContent(
+  event: Omit<
+    Extract<Parameters<typeof emitDiagnosticEvent>[0], { type: "model.call.completed" }>,
+    "type"
+  >,
+  modelContent: NonNullable<DiagnosticEventPrivateData["modelContent"]>,
+) {
+  emitTrustedDiagnosticEventWithPrivateData(
+    {
+      type: "model.call.completed",
+      ...event,
+    },
+    { modelContent },
+  );
+}
+
+function emitTrustedToolExecutionCompletedWithContent(
+  event: Omit<
+    Extract<Parameters<typeof emitDiagnosticEvent>[0], { type: "tool.execution.completed" }>,
+    "type"
+  >,
+  toolContent: NonNullable<DiagnosticEventPrivateData["toolContent"]>,
+) {
+  emitTrustedDiagnosticEventWithPrivateData(
+    {
+      type: "tool.execution.completed",
+      ...event,
+    },
+    { toolContent },
+  );
 }
 
 afterAll(() => {
@@ -312,6 +553,7 @@ afterAll(() => {
   vi.doUnmock("@opentelemetry/sdk-logs");
   vi.doUnmock("@opentelemetry/sdk-metrics");
   vi.doUnmock("@opentelemetry/sdk-trace-base");
+  vi.doUnmock("openclaw/plugin-sdk/fetch-runtime");
   vi.doUnmock("@opentelemetry/resources");
   vi.doUnmock("@opentelemetry/semantic-conventions");
   vi.resetModules();
@@ -336,9 +578,17 @@ describe("diagnostics-otel service", () => {
     traceExporterCtor.mockClear();
     metricExporterCtor.mockClear();
     logExporterCtor.mockClear();
+    spanProcessorCtor.mockClear();
+    createNodeProxyAgentMock.mockReset();
+    createNodeProxyAgentMock.mockReturnValue(undefined);
+    unhandledRejectionHandlerState.reset();
+    unhandledRejectionHandlerState.register.mockClear();
     delete process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
     delete process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT;
     delete process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
+    for (const key of OTEL_CERT_ENV_KEYS) {
+      delete process.env[key];
+    }
   });
 
   afterEach(() => {
@@ -369,6 +619,70 @@ describe("diagnostics-otel service", () => {
     } else {
       process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = ORIGINAL_OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
     }
+    for (const key of OTEL_CERT_ENV_KEYS) {
+      const value = ORIGINAL_OTEL_CERT_ENV[key];
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  });
+
+  test("drops camelCase and snake_case diagnostic id log attributes before export", async () => {
+    const emitCall = await emitAndCaptureLog({
+      level: "INFO",
+      message: "diagnostic id attributes",
+      attributes: {
+        callId: "call-camel",
+        call_id: "call-snake",
+        chatId: "chat-camel",
+        chat_id: "chat-snake",
+        messageId: "message-camel",
+        message_id: "message-snake",
+        parentSpanId: "parent-camel",
+        parent_span_id: "parent-snake",
+        runId: "run-camel",
+        run_id: "run-snake",
+        sessionId: "session-camel",
+        session_id: "session-snake",
+        sessionKey: "session-key-camel",
+        session_key: "session-key-snake",
+        spanId: "span-camel",
+        span_id: "span-snake",
+        toolCallId: "tool-camel",
+        tool_call_id: "tool-snake",
+        traceId: "trace-camel",
+        trace_id: "trace-snake",
+        provider: "openai",
+      },
+    });
+
+    expect(emitCall.attributes?.["openclaw.provider"]).toBe("openai");
+    for (const key of [
+      "openclaw.callId",
+      "openclaw.call_id",
+      "openclaw.chatId",
+      "openclaw.chat_id",
+      "openclaw.messageId",
+      "openclaw.message_id",
+      "openclaw.parentSpanId",
+      "openclaw.parent_span_id",
+      "openclaw.runId",
+      "openclaw.run_id",
+      "openclaw.sessionId",
+      "openclaw.session_id",
+      "openclaw.sessionKey",
+      "openclaw.session_key",
+      "openclaw.spanId",
+      "openclaw.span_id",
+      "openclaw.toolCallId",
+      "openclaw.tool_call_id",
+      "openclaw.traceId",
+      "openclaw.trace_id",
+    ]) {
+      expect(Object.hasOwn(emitCall.attributes ?? {}, key)).toBe(false);
+    }
   });
 
   test("records message-flow metrics and spans", async () => {
@@ -393,6 +707,41 @@ describe("diagnostics-otel service", () => {
       channel: "telegram",
       source: "telegram",
       queueDepth: 2,
+    });
+    emitDiagnosticEvent({
+      type: "message.received",
+      channel: "telegram",
+      source: "webhook",
+    });
+    emitDiagnosticEvent({
+      type: "message.dispatch.started",
+      channel: "telegram",
+      source: "webhook",
+    });
+    emitDiagnosticEvent({
+      type: "message.dispatch.completed",
+      channel: "telegram",
+      source: "webhook",
+      durationMs: 25,
+      outcome: "completed",
+    });
+    emitDiagnosticEvent({
+      type: "message.received",
+      channel: "telegram/custom",
+      source: "webhook with secret sk-test",
+    });
+    emitDiagnosticEvent({
+      type: "message.dispatch.started",
+      channel: "telegram/custom",
+      source: "webhook with secret sk-test",
+    });
+    emitDiagnosticEvent({
+      type: "message.dispatch.completed",
+      channel: "telegram/custom",
+      source: "webhook with secret sk-test",
+      durationMs: 30,
+      outcome: "completed",
+      reason: "progress draft / message tool 123",
     });
     emitDiagnosticEvent({
       type: "message.processed",
@@ -447,6 +796,66 @@ describe("diagnostics-otel service", () => {
       "openclaw.channel": "telegram",
       "openclaw.outcome": "completed",
     });
+    expect(telemetryState.counters.get("openclaw.message.received")?.add).toHaveBeenCalledWith(1, {
+      "openclaw.channel": "telegram",
+      "openclaw.source": "webhook",
+    });
+    expect(telemetryState.counters.get("openclaw.message.received")?.add).toHaveBeenCalledWith(1, {
+      "openclaw.channel": "unknown",
+      "openclaw.source": "unknown",
+    });
+    expect(
+      telemetryState.counters.get("openclaw.message.dispatch.started")?.add,
+    ).toHaveBeenCalledWith(1, {
+      "openclaw.channel": "telegram",
+      "openclaw.source": "webhook",
+    });
+    expect(
+      telemetryState.counters.get("openclaw.message.dispatch.started")?.add,
+    ).toHaveBeenCalledWith(1, {
+      "openclaw.channel": "unknown",
+      "openclaw.source": "unknown",
+    });
+    expect(
+      telemetryState.counters.get("openclaw.message.dispatch.completed")?.add,
+    ).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        "openclaw.channel": "telegram",
+        "openclaw.outcome": "completed",
+        "openclaw.source": "webhook",
+      }),
+    );
+    expect(
+      telemetryState.counters.get("openclaw.message.dispatch.completed")?.add,
+    ).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        "openclaw.channel": "unknown",
+        "openclaw.reason": "none",
+        "openclaw.source": "unknown",
+      }),
+    );
+    expect(
+      telemetryState.histograms.get("openclaw.message.dispatch.duration_ms")?.record,
+    ).toHaveBeenCalledWith(
+      25,
+      expect.objectContaining({
+        "openclaw.channel": "telegram",
+        "openclaw.outcome": "completed",
+        "openclaw.source": "webhook",
+      }),
+    );
+    expect(
+      telemetryState.histograms.get("openclaw.message.dispatch.duration_ms")?.record,
+    ).toHaveBeenCalledWith(
+      30,
+      expect.objectContaining({
+        "openclaw.channel": "unknown",
+        "openclaw.reason": "none",
+        "openclaw.source": "unknown",
+      }),
+    );
     expect(
       telemetryState.histograms.get("openclaw.message.duration_ms")?.record,
     ).toHaveBeenCalledWith(55, {
@@ -471,6 +880,22 @@ describe("diagnostics-otel service", () => {
     expect(telemetryState.counters.get("openclaw.run.attempt")?.add).toHaveBeenCalledWith(1, {
       "openclaw.attempt": 2,
     });
+
+    emitDiagnosticEvent({
+      type: "session.turn.created",
+      runId: "run-1",
+      agentId: "agent.default",
+      channel: "telegram",
+      trigger: "user",
+    });
+    expect(telemetryState.counters.get("openclaw.session.turn.created")?.add).toHaveBeenCalledWith(
+      1,
+      {
+        "openclaw.agent": "agent.default",
+        "openclaw.channel": "telegram",
+        "openclaw.trigger": "user",
+      },
+    );
 
     const spanNames = telemetryState.tracer.startSpan.mock.calls.map((call) => call[0]);
     expect(spanNames).toContain("openclaw.webhook.processed");
@@ -529,6 +954,54 @@ describe("diagnostics-otel service", () => {
       durationMs: 10,
     });
     expect(telemetryState.tracer.startSpan).not.toHaveBeenCalled();
+  });
+
+  test("registers and removes an OTLP exporter unhandled rejection handler", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true, logs: true });
+
+    await service.start(ctx);
+
+    expect(unhandledRejectionHandlerState.register).toHaveBeenCalledTimes(1);
+    const handler = unhandledRejectionHandlerState.getHandlers()[0];
+    expect(handler).toBeTypeOf("function");
+
+    const errorInstance = Object.assign(new Error("collector gone"), {
+      name: "OTLPExporterError",
+      code: 410,
+    });
+    expect(handler?.(errorInstance)).toBe(true);
+    expect(handler?.({ name: "OTLPExporterError", code: 410, data: "user_stop" })).toBe(true);
+    expect(handler?.([{ name: "OTLPExporterError", code: 410, data: "user_stop" }])).toBe(true);
+    expect(
+      handler?.(
+        new AggregateError(
+          [{ name: "OTLPExporterError", code: 410, data: "user_stop" }],
+          "export failed",
+        ),
+      ),
+    ).toBe(true);
+    expect(handler?.(new Error("other exporter error"))).toBe(false);
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      "diagnostics-otel: suppressed OTLP exporter unhandled rejection (code=410)",
+    );
+
+    await service.stop?.(ctx);
+    expect(unhandledRejectionHandlerState.getHandlers()).toHaveLength(0);
+  });
+
+  test("does not retain an OTLP exporter handler when startup setup fails", async () => {
+    const startupError = new Error("trace exporter setup failed");
+    traceExporterCtor.mockImplementationOnce(() => {
+      throw startupError;
+    });
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true });
+
+    await expect(service.start(ctx)).rejects.toBe(startupError);
+
+    expect(unhandledRejectionHandlerState.register).not.toHaveBeenCalled();
+    expect(unhandledRejectionHandlerState.getHandlers()).toHaveLength(0);
   });
 
   test("uses a preloaded OpenTelemetry SDK without dropping diagnostic listeners", async () => {
@@ -605,6 +1078,207 @@ describe("diagnostics-otel service", () => {
     await service.stop?.(ctx);
   });
 
+  test("exports trusted security events as bounded OTLP logs", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { logs: true });
+    const trace = createDiagnosticTraceContext({
+      traceId: TRACE_ID,
+      spanId: SPAN_ID,
+      traceFlags: "01",
+    });
+
+    await service.start(ctx);
+    emitTrustedSecurityEvent({
+      eventId: "security-event-1",
+      category: "tool",
+      action: "tool.execution.blocked",
+      outcome: "denied",
+      severity: "medium",
+      reason: "tools.deny",
+      actor: {
+        kind: "agent",
+        idHash: "agent-hash-1",
+        role: "operator",
+        scopes: ["operator.read", "operator.approvals"],
+      },
+      target: {
+        kind: "plugin",
+        name: "@acme/security-event-plugin",
+        owner: "plugin-installer",
+      },
+      policy: {
+        id: "tools.exec",
+        decision: "deny",
+        reason: "allowlist.miss",
+      },
+      control: {
+        id: "exec-approval",
+        family: "approval",
+      },
+      attributes: {
+        params_kind: "object",
+        secretish: "token sk-test-secret",
+        [PROTO_KEY]: "blocked",
+      },
+      trace,
+    });
+    await flushDiagnosticEvents();
+
+    const emitCall = mockCallArg(logEmit, 0) as {
+      attributes?: Record<string, unknown>;
+      body?: string;
+      context?: unknown;
+      severityNumber?: number;
+      severityText?: string;
+    };
+    expect(emitCall.body).toBe("openclaw.security.event");
+    expect(emitCall.severityText).toBe("WARN");
+    expect(emitCall.severityNumber).toBe(13);
+    expect(emitCall.attributes).toMatchObject({
+      "openclaw.security.event_id": "security-event-1",
+      "openclaw.security.category": "tool",
+      "openclaw.security.action": "tool.execution.blocked",
+      "openclaw.security.outcome": "denied",
+      "openclaw.security.severity": "medium",
+      "openclaw.security.reason": "tools.deny",
+      "openclaw.security.actor.kind": "agent",
+      "openclaw.security.actor.id_hash": "agent-hash-1",
+      "openclaw.security.actor.role": "operator",
+      "openclaw.security.actor.scopes": "operator.read,operator.approvals",
+      "openclaw.security.target.kind": "plugin",
+      "openclaw.security.target.name": "@acme/security-event-plugin",
+      "openclaw.security.target.owner": "plugin-installer",
+      "openclaw.security.policy.id": "tools.exec",
+      "openclaw.security.policy.decision": "deny",
+      "openclaw.security.policy.reason": "allowlist.miss",
+      "openclaw.security.control.id": "exec-approval",
+      "openclaw.security.control.family": "approval",
+      "openclaw.security.attribute.params_kind": "object",
+      "openclaw.security.attribute.secretish": "unknown",
+    });
+    expect(emitCall.context).toEqual({
+      spanContext: {
+        traceId: TRACE_ID,
+        spanId: SPAN_ID,
+        traceFlags: 1,
+        isRemote: true,
+      },
+    });
+    expect(Object.hasOwn(emitCall.attributes ?? {}, "openclaw.security.attribute.__proto__")).toBe(
+      false,
+    );
+    expect(JSON.stringify(emitCall)).not.toContain("sk-test-secret");
+
+    await service.stop?.(ctx);
+  });
+
+  test("does not export security events when OTLP logs are disabled", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { logs: false, metrics: true });
+
+    await service.start(ctx);
+    emitTrustedSecurityEvent({
+      eventId: "security-event-logs-disabled",
+      category: "auth",
+      action: "gateway.auth.failed",
+      outcome: "failure",
+      severity: "high",
+    });
+    await flushDiagnosticEvents();
+
+    expect(logEmit).not.toHaveBeenCalled();
+
+    await service.stop?.(ctx);
+  });
+
+  test("starts stdout-only logs when OTLP protocol is unsupported", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      traces: false,
+      metrics: false,
+      logs: true,
+      protocol: "grpc",
+      logsExporter: "stdout",
+    });
+    const capture = captureStdoutWrites();
+    try {
+      await service.start(ctx);
+      emitDiagnosticEvent({
+        type: "log.record",
+        level: "INFO",
+        message: "stdout only log",
+      });
+      await flushDiagnosticEvents();
+
+      const line = parseSingleStdoutDiagnosticLogLine(capture.writes);
+      expect(line.body).toBe("log");
+      expect(logExporterCtor).not.toHaveBeenCalled();
+      expect(traceExporterCtor).not.toHaveBeenCalled();
+      expect(metricExporterCtor).not.toHaveBeenCalled();
+      expect(ctx.logger.warn).not.toHaveBeenCalledWith(
+        "diagnostics-otel: unsupported protocol grpc",
+      );
+    } finally {
+      capture.spy.mockRestore();
+      await service.stop?.(ctx);
+    }
+  });
+
+  test("exports trusted security events as stdout JSONL logs", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext("", { logs: true, logsExporter: "stdout" });
+    const trace = createDiagnosticTraceContext({
+      traceId: TRACE_ID,
+      spanId: SPAN_ID,
+      traceFlags: "01",
+    });
+    const stdout = captureStdoutWrites();
+
+    try {
+      await service.start(ctx);
+      emitTrustedSecurityEvent({
+        eventId: "security-event-stdout",
+        category: "tool",
+        action: "tool.execution.blocked",
+        outcome: "denied",
+        severity: "medium",
+        reason: "tools.deny",
+        attributes: {
+          secretish: "token sk-test-secret",
+          [PROTO_KEY]: "blocked",
+        },
+        trace,
+      });
+      await flushDiagnosticEvents();
+
+      expect(logExporterCtor).not.toHaveBeenCalled();
+      expect(logEmit).not.toHaveBeenCalled();
+      const record = parseSingleStdoutDiagnosticLogLine(stdout.writes);
+      expect(record.body).toBe("openclaw.security.event");
+      expect(record.severityText).toBe("WARN");
+      expect(record.severityNumber).toBe(13);
+      expect(record.attributes).toMatchObject({
+        "openclaw.security.event_id": "security-event-stdout",
+        "openclaw.security.category": "tool",
+        "openclaw.security.action": "tool.execution.blocked",
+        "openclaw.security.outcome": "denied",
+        "openclaw.security.severity": "medium",
+        "openclaw.security.reason": "tools.deny",
+        "openclaw.security.attribute.secretish": "unknown",
+      });
+      expect(Object.hasOwn(record.attributes ?? {}, "openclaw.security.attribute.__proto__")).toBe(
+        false,
+      );
+      expect(record.trace_id).toBe(TRACE_ID);
+      expect(record.span_id).toBe(SPAN_ID);
+      expect(record.trace_flags).toBe("01");
+      expect(JSON.stringify(record)).not.toContain("sk-test-secret");
+    } finally {
+      stdout.spy.mockRestore();
+      await service.stop?.(ctx);
+    }
+  });
+
   test("records liveness warning diagnostics", async () => {
     const service = createDiagnosticsOtelService();
     const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
@@ -650,6 +1324,43 @@ describe("diagnostics-otel service", () => {
     expect(span?.setStatus).toHaveBeenCalledWith({
       code: 2,
       message: "event_loop_delay:cpu",
+    });
+
+    await service.stop?.(ctx);
+  });
+
+  test("records oversized payload metrics without raw identifiers", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { metrics: true, traces: false });
+
+    await service.start(ctx);
+    emitTrustedDiagnosticEvent({
+      type: "payload.large",
+      surface: "gateway.frame",
+      action: "rejected",
+      bytes: 2048,
+      limitBytes: 1024,
+      channel: "web",
+      pluginId: "agent:qa:otel-trace-smoke",
+      reason: "body-too-large",
+    });
+    await flushDiagnosticEvents();
+
+    expect(telemetryState.counters.get("openclaw.payload.large")?.add).toHaveBeenCalledWith(1, {
+      "openclaw.payload.action": "rejected",
+      "openclaw.payload.surface": "gateway.frame",
+      "openclaw.channel": "web",
+      "openclaw.plugin": "none",
+      "openclaw.reason": "body-too-large",
+    });
+    expect(
+      telemetryState.histograms.get("openclaw.payload.large_bytes")?.record,
+    ).toHaveBeenCalledWith(2048, {
+      "openclaw.payload.action": "rejected",
+      "openclaw.payload.surface": "gateway.frame",
+      "openclaw.channel": "web",
+      "openclaw.plugin": "none",
+      "openclaw.reason": "body-too-large",
     });
 
     await service.stop?.(ctx);
@@ -744,6 +1455,132 @@ describe("diagnostics-otel service", () => {
     await service.stop?.(ctx);
   });
 
+  test("run.completed error span carries the redacted message off the metric attrs", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEventWithPrivateData(
+      {
+        type: "run.completed",
+        runId: "run-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        outcome: "error",
+        errorCategory: "Error",
+        durationMs: 100,
+      },
+      { errorMessage: "upstream model stream stalled then aborted" },
+    );
+    await flushDiagnosticEvents();
+
+    expect(startedSpanOptions("openclaw.run")?.attributes?.["openclaw.error"]).toBe(
+      "upstream model stream stalled then aborted",
+    );
+    expect(spanByName("openclaw.run").setStatus).toHaveBeenCalledWith({
+      code: 2,
+      message: "upstream model stream stalled then aborted",
+    });
+    // The raw message must never widen metric cardinality.
+    const runDuration = lastHistogramRecord("openclaw.run.duration_ms");
+    expect(runDuration?.[1]?.["openclaw.outcome"]).toBe("error");
+    expect(Object.hasOwn(runDuration?.[1] ?? {}, "openclaw.error")).toBe(false);
+
+    await service.stop?.(ctx);
+  });
+
+  test("run.completed bounds sensitive error text before export", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true });
+    await service.start(ctx);
+    const secret = "sk-1234567890abcdef";
+
+    emitTrustedDiagnosticEventWithPrivateData(
+      {
+        type: "run.completed",
+        runId: "run-1",
+        outcome: "error",
+        errorCategory: "Error",
+        durationMs: 100,
+      },
+      { errorMessage: `OPENAI_API_KEY=${secret} ${"x".repeat(8 * 1024)}` },
+    );
+    await flushDiagnosticEvents();
+
+    const status = mockCallArg(spanByName("openclaw.run").setStatus, 0) as {
+      message?: string;
+    };
+    expect(status.message).not.toContain(secret);
+    expect(status.message).toMatch(/\.\.\.\(truncated\)$/u);
+    expect(status.message?.length).toBeLessThanOrEqual(4 * 1024 + 20);
+
+    await service.stop?.(ctx);
+  });
+
+  test("harness.run.completed error span carries the redacted message", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEventWithPrivateData(
+      {
+        type: "harness.run.completed",
+        runId: "run-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        harnessId: "openclaw",
+        outcome: "error",
+        durationMs: 90,
+        itemLifecycle: { startedCount: 1, completedCount: 1, activeCount: 0 },
+      },
+      { errorMessage: "model run failed during resolve phase" },
+    );
+    await flushDiagnosticEvents();
+
+    expect(startedSpanOptions("openclaw.harness.run")?.attributes?.["openclaw.error"]).toBe(
+      "model run failed during resolve phase",
+    );
+    expect(spanByName("openclaw.harness.run").setStatus).toHaveBeenCalledWith({
+      code: 2,
+      message: "model run failed during resolve phase",
+    });
+    const harnessDuration = lastHistogramRecord("openclaw.harness.duration_ms");
+    expect(Object.hasOwn(harnessDuration?.[1] ?? {}, "openclaw.error")).toBe(false);
+
+    await service.stop?.(ctx);
+  });
+
+  test("harness.run.error span prefers the redacted message over the category", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEventWithPrivateData(
+      {
+        type: "harness.run.error",
+        runId: "run-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        harnessId: "openclaw",
+        phase: "resolve",
+        errorCategory: "Error",
+        durationMs: 90,
+      },
+      { errorMessage: "harness cleanup threw" },
+    );
+    await flushDiagnosticEvents();
+
+    expect(startedSpanOptions("openclaw.harness.run")?.attributes?.["openclaw.error"]).toBe(
+      "harness cleanup threw",
+    );
+    expect(spanByName("openclaw.harness.run").setStatus).toHaveBeenCalledWith({
+      code: 2,
+      message: "harness cleanup threw",
+    });
+
+    await service.stop?.(ctx);
+  });
+
   test("honors disabled traces when an OpenTelemetry SDK is preloaded", async () => {
     process.env.OPENCLAW_OTEL_PRELOADED = "1";
     const service = createDiagnosticsOtelService();
@@ -768,6 +1605,37 @@ describe("diagnostics-otel service", () => {
 
     await service.stop?.(ctx);
     expect(sdkShutdown).not.toHaveBeenCalled();
+  });
+
+  test("treats omitted diagnostics enabled flag as enabled", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      traces: true,
+      captureContent: true,
+    });
+    delete (ctx.config.diagnostics as { enabled?: boolean }).enabled;
+    await service.start(ctx);
+
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      { inputMessages: ["user prompt"] },
+    );
+    await flushDiagnosticEvents();
+
+    const modelCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.model.call",
+    );
+    const attrs = (modelCall?.[1] as { attributes?: Record<string, unknown> } | undefined)
+      ?.attributes;
+    expect(attrs?.["openclaw.content.input_messages"]).toBe("user prompt");
+
+    await service.stop?.(ctx);
   });
 
   test("tears down active handles when restarted with diagnostics disabled", async () => {
@@ -826,6 +1694,26 @@ describe("diagnostics-otel service", () => {
     await service.stop?.(ctx);
   });
 
+  test("inserts signal path before shared endpoint query params", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createTraceOnlyContext("https://collector.example.com/otlp?timeout=30s");
+    await service.start(ctx);
+
+    const options = firstExporterOptions(traceExporterCtor);
+    expect(options.url).toBe("https://collector.example.com/otlp/v1/traces?timeout=30s");
+    await service.stop?.(ctx);
+  });
+
+  test("inserts signal path before shared endpoint fragments", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createTraceOnlyContext("https://collector.example.com/otlp#tenant-a");
+    await service.start(ctx);
+
+    const options = firstExporterOptions(traceExporterCtor);
+    expect(options.url).toBe("https://collector.example.com/otlp/v1/traces#tenant-a");
+    await service.stop?.(ctx);
+  });
+
   test("keeps signal-qualified endpoint unchanged when signal path casing differs", async () => {
     const service = createDiagnosticsOtelService();
     const ctx = createTraceOnlyContext("https://collector.example.com/v1/Traces");
@@ -833,6 +1721,18 @@ describe("diagnostics-otel service", () => {
 
     const options = firstExporterOptions(traceExporterCtor);
     expect(options.url).toBe("https://collector.example.com/v1/Traces");
+    await service.stop?.(ctx);
+  });
+
+  test("applies flush interval to trace batching", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createTraceOnlyContext(OTEL_TEST_ENDPOINT);
+    ctx.config.diagnostics!.otel!.flushIntervalMs = 250;
+
+    await service.start(ctx);
+
+    expect(spanProcessorCtor).toHaveBeenCalledTimes(1);
+    expect(firstSpanProcessorOptions().scheduledDelayMillis).toBe(1000);
     await service.stop?.(ctx);
   });
 
@@ -880,11 +1780,308 @@ describe("diagnostics-otel service", () => {
     await service.stop?.(ctx);
   });
 
-  test("redacts sensitive data from log messages before export", async () => {
+  test("passes env proxy agents to OTLP HTTP exporters", async () => {
+    createNodeProxyAgentMock.mockReturnValue(nodeProxyAgent);
+
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext("https://collector.example.com/otlp", {
+      traces: true,
+      metrics: true,
+      logs: true,
+    });
+    await service.start(ctx);
+
+    const traceOptions = firstExporterOptions(traceExporterCtor);
+    const metricOptions = firstExporterOptions(metricExporterCtor);
+    const logOptions = firstExporterOptions(logExporterCtor);
+    expect(traceOptions.httpAgentOptions?.("https:")).toBe(nodeProxyAgent);
+    expect(metricOptions.httpAgentOptions?.("https:")).toBe(nodeProxyAgent);
+    expect(logOptions.httpAgentOptions?.("https:")).toBe(nodeProxyAgent);
+    expect(createNodeProxyAgentCalls()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          mode: "env",
+          targetUrl: "https://collector.example.com/otlp/v1/traces",
+          agentOptions: expect.objectContaining({ keepAlive: true }),
+        }),
+        expect.objectContaining({
+          mode: "env",
+          targetUrl: "https://collector.example.com/otlp/v1/metrics",
+          agentOptions: expect.objectContaining({ keepAlive: true }),
+        }),
+        expect.objectContaining({
+          mode: "env",
+          targetUrl: "https://collector.example.com/otlp/v1/logs",
+          agentOptions: expect.objectContaining({ keepAlive: true }),
+        }),
+      ]),
+    );
+    await service.stop?.(ctx);
+  });
+
+  test("preserves OTLP TLS env options when passing env proxy agents", async () => {
+    const certDir = mkdtempSync(path.join(tmpdir(), "openclaw-otel-tls-"));
+    try {
+      const rootCertificatePath = path.join(certDir, "root.pem");
+      const clientCertificatePath = path.join(certDir, "client.pem");
+      const clientKeyPath = path.join(certDir, "client-key.pem");
+      writeFileSync(rootCertificatePath, "root-certificate");
+      writeFileSync(clientCertificatePath, "trace-client-certificate");
+      writeFileSync(clientKeyPath, "client-key");
+      process.env.OTEL_EXPORTER_OTLP_CERTIFICATE = rootCertificatePath;
+      process.env.OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE = clientCertificatePath;
+      process.env.OTEL_EXPORTER_OTLP_CLIENT_KEY = clientKeyPath;
+      createNodeProxyAgentMock.mockReturnValue(nodeProxyAgent);
+
+      const service = createDiagnosticsOtelService();
+      const ctx = createOtelContext("https://collector.example.com/otlp", {
+        traces: true,
+        metrics: true,
+        logs: true,
+      });
+      await service.start(ctx);
+
+      const traceCall = findCreateNodeProxyAgentCall(
+        "https://collector.example.com/otlp/v1/traces",
+      );
+      const metricCall = findCreateNodeProxyAgentCall(
+        "https://collector.example.com/otlp/v1/metrics",
+      );
+      expect(traceCall.agentOptions).toEqual({
+        keepAlive: true,
+        ca: Buffer.from("root-certificate"),
+        cert: Buffer.from("trace-client-certificate"),
+        key: Buffer.from("client-key"),
+      });
+      expect(metricCall.agentOptions).toEqual({
+        keepAlive: true,
+        ca: Buffer.from("root-certificate"),
+        key: Buffer.from("client-key"),
+      });
+      await service.stop?.(ctx);
+    } finally {
+      rmSync(certDir, { force: true, recursive: true });
+    }
+  });
+
+  test("falls back to shared OTLP TLS env options when signal-specific values are empty", async () => {
+    const certDir = mkdtempSync(path.join(tmpdir(), "openclaw-otel-tls-"));
+    try {
+      const rootCertificatePath = path.join(certDir, "root.pem");
+      writeFileSync(rootCertificatePath, "shared-root-certificate");
+      process.env.OTEL_EXPORTER_OTLP_CERTIFICATE = rootCertificatePath;
+      process.env.OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE = "   ";
+      createNodeProxyAgentMock.mockReturnValue(nodeProxyAgent);
+
+      const service = createDiagnosticsOtelService();
+      const ctx = createOtelContext("https://collector.example.com/otlp", {
+        traces: true,
+      });
+      await service.start(ctx);
+
+      const traceCall = findCreateNodeProxyAgentCall(
+        "https://collector.example.com/otlp/v1/traces",
+      );
+      expect(traceCall.agentOptions).toEqual({
+        keepAlive: true,
+        ca: Buffer.from("shared-root-certificate"),
+      });
+      await service.stop?.(ctx);
+    } finally {
+      rmSync(certDir, { force: true, recursive: true });
+    }
+  });
+
+  test("falls back to default OTLP agents when env proxy agent creation fails", async () => {
+    createNodeProxyAgentMock.mockImplementation(() => {
+      throw new Error("unsupported proxy protocol");
+    });
+
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext("https://collector.example.com/otlp", {
+      traces: true,
+      metrics: true,
+      logs: true,
+    });
+    await service.start(ctx);
+
+    expect(firstExporterOptions(traceExporterCtor).httpAgentOptions).toBeUndefined();
+    expect(firstExporterOptions(metricExporterCtor).httpAgentOptions).toBeUndefined();
+    expect(firstExporterOptions(logExporterCtor).httpAgentOptions).toBeUndefined();
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      "diagnostics-otel: env proxy agent unavailable for OTLP traces exporter; falling back to default Node agent",
+    );
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      "diagnostics-otel: env proxy agent unavailable for OTLP metrics exporter; falling back to default Node agent",
+    );
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      "diagnostics-otel: env proxy agent unavailable for OTLP logs exporter; falling back to default Node agent",
+    );
+    await service.stop?.(ctx);
+  });
+
+  test("leaves OTLP HTTP exporters on their default agents when env proxy is bypassed", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext("https://collector.example.com/otlp", {
+      traces: true,
+      metrics: true,
+      logs: true,
+    });
+    await service.start(ctx);
+
+    expect(firstExporterOptions(traceExporterCtor).httpAgentOptions).toBeUndefined();
+    expect(firstExporterOptions(metricExporterCtor).httpAgentOptions).toBeUndefined();
+    expect(firstExporterOptions(logExporterCtor).httpAgentOptions).toBeUndefined();
+    expect(createNodeProxyAgentMock).toHaveBeenCalledTimes(3);
+    await service.stop?.(ctx);
+  });
+
+  test("exports diagnostic logs as stdout JSONL without constructing the OTLP log exporter", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext("", {
+      logs: true,
+      logsExporter: "stdout",
+      captureContent: true,
+    });
+    ctx.config.diagnostics!.otel!.serviceName = "rovoclaw-openclaw";
+    const stdout = captureStdoutWrites();
+
+    try {
+      await service.start(ctx);
+
+      expect(logExporterCtor).not.toHaveBeenCalled();
+      emitDiagnosticEventWithTrustedTraceContext({
+        type: "log.record",
+        level: "WARN",
+        message: "Using API key sk-1234567890abcdef1234567890abcdef",
+        attributes: {
+          token: "ghp_abcdefghijklmnopqrstuvwxyz123456", // pragma: allowlist secret
+          subsystem: "diagnostic",
+        },
+        trace: {
+          traceId: TRACE_ID,
+          spanId: SPAN_ID,
+          traceFlags: "01",
+        },
+      });
+      await flushDiagnosticEvents();
+
+      expect(logEmit).not.toHaveBeenCalled();
+      const record = parseSingleStdoutDiagnosticLogLine(stdout.writes);
+      expect(record.ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      expect(record.signal).toBe("openclaw.diagnostic.log");
+      expect(record["service.name"]).toBe("rovoclaw-openclaw");
+      expect(record.severityText).toBe("WARN");
+      expect(record.severityNumber).toBe(13);
+      expect(String(record.body)).not.toContain("sk-1234567890abcdef1234567890abcdef");
+      expect(String(record.body)).toContain("sk-123");
+      expect(record.attributes).toMatchObject({
+        "openclaw.log.level": "WARN",
+        "openclaw.subsystem": "diagnostic",
+      });
+      const tokenAttr = record.attributes?.["openclaw.token"];
+      expect(tokenAttr).not.toBe("ghp_abcdefghijklmnopqrstuvwxyz123456"); // pragma: allowlist secret
+      expect(record.trace_id).toBe(TRACE_ID);
+      expect(record.span_id).toBe(SPAN_ID);
+      expect(JSON.stringify(record)).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz123456"); // pragma: allowlist secret
+    } finally {
+      stdout.spy.mockRestore();
+      await service.stop?.(ctx);
+    }
+  });
+
+  test("keeps explicit OTLP log export off stdout", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      logs: true,
+      logsExporter: "otlp",
+    });
+    const stdout = captureStdoutWrites();
+
+    try {
+      await service.start(ctx);
+      emitDiagnosticEvent({
+        type: "log.record",
+        level: "INFO",
+        message: "otlp only",
+      });
+      await flushDiagnosticEvents();
+
+      expect(logExporterCtor).toHaveBeenCalledTimes(1);
+      expect(logEmit).toHaveBeenCalledTimes(1);
+      expect(stdout.writes).toEqual([]);
+    } finally {
+      stdout.spy.mockRestore();
+      await service.stop?.(ctx);
+    }
+  });
+
+  test("exports diagnostic logs to OTLP and stdout when logsExporter is both", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      logs: true,
+      logsExporter: "both",
+    });
+    const stdout = captureStdoutWrites();
+
+    try {
+      await service.start(ctx);
+      emitDiagnosticEvent({
+        type: "log.record",
+        level: "ERROR",
+        message: "both sinks",
+        attributes: {
+          subsystem: "diagnostic",
+        },
+      });
+      await flushDiagnosticEvents();
+
+      expect(logExporterCtor).toHaveBeenCalledTimes(1);
+      const emitCall = mockCallArg(logEmit, 0) as {
+        attributes?: Record<string, unknown>;
+        body?: string;
+        severityText?: string;
+      };
+      const record = parseSingleStdoutDiagnosticLogLine(stdout.writes);
+      expect(emitCall.body).toBe("log");
+      expect(record.body).toBe(emitCall.body);
+      expect(record.severityText).toBe(emitCall.severityText);
+      expect(record.attributes).toEqual(emitCall.attributes);
+    } finally {
+      stdout.spy.mockRestore();
+      await service.stop?.(ctx);
+    }
+  });
+
+  test("omits log message bodies from OTLP logs unless broad content capture is enabled", async () => {
     const emitCall = await emitAndCaptureLog({
       level: "INFO",
-      message: "Using API key sk-1234567890abcdef1234567890abcdef",
+      message: "model replied OTEL-QA-OK",
     });
+
+    expect(emitCall?.body).toBe("log");
+  });
+
+  test("keeps granular content capture from enabling OTLP log bodies", async () => {
+    const emitCall = await emitAndCaptureLog(
+      {
+        level: "INFO",
+        message: "model replied OTEL-QA-OK",
+      },
+      { captureContent: { enabled: true, inputMessages: true } },
+    );
+
+    expect(emitCall?.body).toBe("log");
+  });
+
+  test("redacts sensitive data from log messages before export when broad content capture is enabled", async () => {
+    const emitCall = await emitAndCaptureLog(
+      {
+        level: "INFO",
+        message: "Using API key sk-1234567890abcdef1234567890abcdef",
+      },
+      { captureContent: true },
+    );
 
     expect(emitCall?.body).not.toContain("sk-1234567890abcdef1234567890abcdef");
     expect(emitCall?.body).toContain("sk-123");
@@ -928,6 +2125,28 @@ describe("diagnostics-otel service", () => {
     expect(emitCall?.context).toBeUndefined();
   });
 
+  test("attaches trace-only trusted context to exported logs", async () => {
+    const emitCall = await emitAndCaptureLog(
+      {
+        level: "INFO",
+        message: "traceable log",
+        trace: {
+          traceId: TRACE_ID,
+          spanId: SPAN_ID,
+          traceFlags: "01",
+        },
+      },
+      { trustedTraceContext: true },
+    );
+
+    expect(emitCall?.body).toBe("log");
+    expect(telemetryState.tracer.setSpanContext).toHaveBeenCalledTimes(1);
+    const emitContext = emitCall?.context as { spanContext?: Record<string, unknown> } | undefined;
+    const emitSpanContext = emitContext?.spanContext;
+    expect(emitSpanContext?.traceId).toBe(TRACE_ID);
+    expect(emitSpanContext?.spanId).toBe(SPAN_ID);
+  });
+
   test("attaches trusted diagnostic trace context to exported logs", async () => {
     const emitCall = await emitAndCaptureLog(
       {
@@ -956,11 +2175,13 @@ describe("diagnostics-otel service", () => {
 
   test("bounds plugin-emitted log attributes and omits source paths", async () => {
     const service = createDiagnosticsOtelService();
-    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { logs: true });
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { logs: true, captureContent: true });
     await service.start(ctx);
 
+    const boundaryMessage = `${"x".repeat(4095)}🚀tail`;
+    const boundaryAttribute = `${"y".repeat(4095)}🚀tail`;
     const attributes = Object.create(null) as Record<string, string>;
-    attributes.good = "y".repeat(6000);
+    attributes.good = boundaryAttribute;
     attributes["bad key"] = "drop-me";
     attributes[PROTO_KEY] = "pollute";
     attributes["constructor"] = "pollute";
@@ -970,7 +2191,7 @@ describe("diagnostics-otel service", () => {
     emitDiagnosticEvent({
       type: "log.record",
       level: "INFO",
-      message: "x".repeat(6000),
+      message: boundaryMessage,
       attributes,
       code: {
         filepath: "/Users/alice/openclaw/src/private.ts",
@@ -985,11 +2206,10 @@ describe("diagnostics-otel service", () => {
       attributes: Record<string, unknown>;
       body: string;
     };
-    expect(emitCall.body.length).toBeLessThanOrEqual(4200);
-    expect(String(emitCall.attributes["openclaw.good"])).toMatch(/^y+/);
+    expect(emitCall.body).toBe(`${"x".repeat(4095)}...(truncated)`);
+    expect(emitCall.attributes["openclaw.good"]).toBe(`${"y".repeat(4095)}...(truncated)`);
     expect(emitCall.attributes["code.lineno"]).toBe(42);
     expect(emitCall.attributes["code.function"]).toBe("handler");
-    expect(String(emitCall.attributes["openclaw.good"]).length).toBeLessThanOrEqual(4200);
     expect(Object.hasOwn(emitCall.attributes, `openclaw.${PROTO_KEY}`)).toBe(false);
     expect(Object.hasOwn(emitCall.attributes, "openclaw.constructor")).toBe(false);
     expect(Object.hasOwn(emitCall.attributes, "openclaw.prototype")).toBe(false);
@@ -1125,6 +2345,38 @@ describe("diagnostics-otel service", () => {
     await service.stop?.(ctx);
   });
 
+  test("advertises explicit duration buckets on the openclaw run/harness/context histograms", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { metrics: true });
+    const priorSdkBoundaries = [
+      0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000,
+    ];
+    try {
+      await service.start(ctx);
+
+      const runDurationOptions = histogramCreateOptions("openclaw.run.duration_ms");
+      expect(runDurationOptions?.unit).toBe("ms");
+      const runBoundaries = runDurationOptions?.advice?.explicitBucketBoundaries;
+      expect(runBoundaries).toEqual(expect.arrayContaining(priorSdkBoundaries));
+      for (const boundary of [60000, 3_600_000]) {
+        expect(runBoundaries).toContain(boundary);
+      }
+
+      const harnessDurationOptions = histogramCreateOptions("openclaw.harness.duration_ms");
+      const harnessBoundaries = harnessDurationOptions?.advice?.explicitBucketBoundaries;
+      expect(harnessBoundaries).toEqual(runBoundaries);
+
+      const contextOptions = histogramCreateOptions("openclaw.context.tokens");
+      const contextBoundaries = contextOptions?.advice?.explicitBucketBoundaries;
+      expect(contextBoundaries).toEqual(expect.arrayContaining(priorSdkBoundaries));
+      for (const boundary of [128000, 1_000_000]) {
+        expect(contextBoundaries).toContain(boundary);
+      }
+    } finally {
+      await service.stop?.(ctx);
+    }
+  });
+
   test("bounds agent identifiers on model usage metric attributes", async () => {
     const service = createDiagnosticsOtelService();
     const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { metrics: true });
@@ -1149,6 +2401,81 @@ describe("diagnostics-otel service", () => {
     expect(
       JSON.stringify(telemetryState.counters.get("openclaw.tokens")?.add.mock.calls),
     ).not.toContain("sk-test-secret-value");
+    await service.stop?.(ctx);
+  });
+
+  test("drops session-shaped agent identifiers from model usage metric attributes", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { metrics: true });
+    await service.start(ctx);
+
+    emitDiagnosticEvent({
+      type: "model.usage",
+      agentId: "Agent:qa:otel-trace-smoke",
+      provider: "openai",
+      model: "gpt-5.4",
+      usage: { input: 2 },
+    });
+    await flushDiagnosticEvents();
+
+    expect(telemetryState.counters.get("openclaw.tokens")?.add).toHaveBeenCalledWith(2, {
+      "openclaw.channel": "unknown",
+      "openclaw.agent": "unknown",
+      "openclaw.provider": "openai",
+      "openclaw.model": "gpt-5.4",
+      "openclaw.token": "input",
+    });
+    expect(
+      JSON.stringify(telemetryState.counters.get("openclaw.tokens")?.add.mock.calls),
+    ).not.toContain("Agent:qa:otel-trace-smoke");
+    await service.stop?.(ctx);
+  });
+
+  test("drops session-shaped queue lane metric attributes", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { metrics: true });
+    await service.start(ctx);
+
+    emitDiagnosticEvent({
+      type: "queue.lane.enqueue",
+      lane: "session:Agent:qa:otel-trace-smoke",
+      queueSize: 2,
+    });
+    await flushDiagnosticEvents();
+
+    expect(telemetryState.counters.get("openclaw.queue.lane.enqueue")?.add).toHaveBeenCalledWith(
+      1,
+      {
+        "openclaw.lane": "session",
+      },
+    );
+    expect(
+      JSON.stringify(telemetryState.counters.get("openclaw.queue.lane.enqueue")?.add.mock.calls),
+    ).not.toContain("Agent:qa:otel-trace-smoke");
+    await service.stop?.(ctx);
+  });
+
+  test("keeps only the bounded prefix from scoped queue lane metric attributes", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { metrics: true });
+    await service.start(ctx);
+
+    emitDiagnosticEvent({
+      type: "queue.lane.enqueue",
+      lane: "dreaming-narrative:session-main",
+      queueSize: 2,
+    });
+    await flushDiagnosticEvents();
+
+    expect(telemetryState.counters.get("openclaw.queue.lane.enqueue")?.add).toHaveBeenCalledWith(
+      1,
+      {
+        "openclaw.lane": "dreaming-narrative",
+      },
+    );
+    expect(
+      JSON.stringify(telemetryState.counters.get("openclaw.queue.lane.enqueue")?.add.mock.calls),
+    ).not.toContain("session-main");
     await service.stop?.(ctx);
   });
 
@@ -1186,7 +2513,7 @@ describe("diagnostics-otel service", () => {
       sessionKey: "session-key",
       sessionId: "session-id",
       provider: "anthropic",
-      model: "claude-sonnet-4.6",
+      model: "anthropic/claude-sonnet-4.6",
       usage: {
         input: 100,
         output: 40,
@@ -1202,7 +2529,9 @@ describe("diagnostics-otel service", () => {
     const modelUsageOptions = startedSpanOptions("openclaw.model.usage");
     expect(modelUsageOptions?.attributes?.["gen_ai.operation.name"]).toBe("chat");
     expect(modelUsageOptions?.attributes?.["gen_ai.system"]).toBe("anthropic");
-    expect(modelUsageOptions?.attributes?.["gen_ai.request.model"]).toBe("claude-sonnet-4.6");
+    expect(modelUsageOptions?.attributes?.["gen_ai.request.model"]).toBe(
+      "anthropic/claude-sonnet-4.6",
+    );
     expect(modelUsageOptions?.attributes?.["gen_ai.usage.input_tokens"]).toBe(150);
     expect(modelUsageOptions?.attributes?.["gen_ai.usage.output_tokens"]).toBe(40);
     expect(modelUsageOptions?.attributes?.["gen_ai.usage.cache_read.input_tokens"]).toBe(30);
@@ -1229,8 +2558,8 @@ describe("diagnostics-otel service", () => {
       runId: "run-1",
       callId: "call-1",
       sessionKey: "session-key",
-      provider: "openai",
-      model: "gpt-5.4",
+      provider: "anthropic",
+      model: "anthropic/claude-sonnet-4.6",
       api: "openai-completions",
       durationMs: 250,
     });
@@ -1259,8 +2588,8 @@ describe("diagnostics-otel service", () => {
     expect(genAiOperationDuration?.record).toHaveBeenCalledTimes(2);
     expect(genAiOperationDuration?.record).toHaveBeenCalledWith(0.25, {
       "gen_ai.operation.name": "text_completion",
-      "gen_ai.provider.name": "openai",
-      "gen_ai.request.model": "gpt-5.4",
+      "gen_ai.provider.name": "anthropic",
+      "gen_ai.request.model": "unknown",
     });
     expect(genAiOperationDuration?.record).toHaveBeenCalledWith(1.25, {
       "gen_ai.operation.name": "generate_content",
@@ -1270,6 +2599,49 @@ describe("diagnostics-otel service", () => {
     });
     expect(JSON.stringify(genAiOperationDuration?.record.mock.calls)).not.toContain("session-key");
     expect(JSON.stringify(genAiOperationDuration?.record.mock.calls)).not.toContain("run-1");
+    await service.stop?.(ctx);
+  });
+
+  test("exports skill usage counter and span without raw identifiers", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "skill.used",
+      agentId: "main",
+      runId: "run-should-not-export",
+      sessionKey: "session-should-not-export",
+      skillName: "tiny-llm-brainstorm",
+      skillSource: "workspace",
+      activation: "read",
+      toolName: "read",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: TOOL_SPAN_ID,
+        parentSpanId: CHILD_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    await flushDiagnosticEvents();
+
+    const expectedAttrs = {
+      "openclaw.agent": "main",
+      "openclaw.skill.activation": "read",
+      "openclaw.skill.name": "tiny-llm-brainstorm",
+      "openclaw.skill.source": "workspace",
+      "openclaw.toolName": "read",
+    };
+    expect(telemetryState.counters.get("openclaw.skill.used")?.add).toHaveBeenCalledWith(
+      1,
+      expectedAttrs,
+    );
+    const skillSpanCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.skill.used",
+    );
+    expect(skillSpanCall?.[1]).toMatchObject({ attributes: expectedAttrs });
+    expect(JSON.stringify(skillSpanCall)).not.toContain("run-should-not-export");
+    expect(JSON.stringify(skillSpanCall)).not.toContain("session-should-not-export");
     await service.stop?.(ctx);
   });
 
@@ -1305,6 +2677,23 @@ describe("diagnostics-otel service", () => {
       requestPayloadBytes: 1234,
       responseStreamBytes: 567,
       timeToFirstByteMs: 45,
+      promptStats: {
+        inputMessagesCount: 2,
+        inputMessagesChars: 3456,
+        systemPromptChars: 789,
+        toolDefinitionsCount: 4,
+        toolDefinitionsChars: 2345,
+        totalChars: 6590,
+      },
+      usage: {
+        input: 100,
+        output: 20,
+        cacheRead: 30,
+        cacheWrite: 5,
+        reasoningTokens: 8,
+        promptTokens: 135,
+        total: 155,
+      },
       trace: {
         traceId: TRACE_ID,
         spanId: CHILD_SPAN_ID,
@@ -1380,6 +2769,7 @@ describe("diagnostics-otel service", () => {
     expect(Object.hasOwn(modelOptions?.attributes ?? {}, "openclaw.runId")).toBe(false);
     expect(Object.hasOwn(modelOptions?.attributes ?? {}, "openclaw.sessionKey")).toBe(false);
     expect(modelOptions?.startTime).toBeTypeOf("number");
+    expect(Object.hasOwn(modelOptions ?? {}, "kind")).toBe(false);
     expect(modelCall?.[2]).toBeUndefined();
 
     const harnessCall = startedSpanCall("openclaw.harness.run");
@@ -1407,6 +2797,7 @@ describe("diagnostics-otel service", () => {
     const toolCall = startedSpanCall("openclaw.tool.execution");
     const toolOptions = toolCall?.[1];
     expect(toolOptions?.attributes?.["openclaw.toolName"]).toBe("read");
+    expect(toolOptions?.attributes?.["openclaw.tool.source"]).toBe("core");
     expect(toolOptions?.attributes?.["openclaw.errorCategory"]).toBe("TypeError");
     expect(toolOptions?.attributes?.["openclaw.errorCode"]).toBe("429");
     expect(toolOptions?.attributes?.["openclaw.tool.params.kind"]).toBe("object");
@@ -1437,6 +2828,21 @@ describe("diagnostics-otel service", () => {
     expect(modelSpanAttributes["openclaw.model_call.request_bytes"]).toBe(1234);
     expect(modelSpanAttributes["openclaw.model_call.response_bytes"]).toBe(567);
     expect(modelSpanAttributes["openclaw.model_call.time_to_first_byte_ms"]).toBe(45);
+    expect(modelSpanAttributes["openclaw.model_call.prompt.input_messages_count"]).toBe(2);
+    expect(modelSpanAttributes["openclaw.model_call.prompt.input_messages_chars"]).toBe(3456);
+    expect(modelSpanAttributes["openclaw.model_call.prompt.system_prompt_chars"]).toBe(789);
+    expect(modelSpanAttributes["openclaw.model_call.prompt.tool_definitions_count"]).toBe(4);
+    expect(modelSpanAttributes["openclaw.model_call.prompt.tool_definitions_chars"]).toBe(2345);
+    expect(modelSpanAttributes["openclaw.model_call.prompt.total_chars"]).toBe(6590);
+    expect(modelSpanAttributes["openclaw.model_call.usage.input_tokens"]).toBe(100);
+    expect(modelSpanAttributes["openclaw.model_call.usage.output_tokens"]).toBe(20);
+    expect(modelSpanAttributes["openclaw.model_call.usage.cache_read_input_tokens"]).toBe(30);
+    expect(modelSpanAttributes["openclaw.model_call.usage.cache_creation_input_tokens"]).toBe(5);
+    expect(modelSpanAttributes["openclaw.model_call.usage.reasoning_output_tokens"]).toBe(8);
+    expect(modelSpanAttributes["openclaw.model_call.usage.prompt_tokens"]).toBe(135);
+    expect(modelSpanAttributes["openclaw.model_call.usage.total_tokens"]).toBe(155);
+    expect(modelSpanAttributes["gen_ai.usage.input_tokens"]).toBe(135);
+    expect(modelSpanAttributes["gen_ai.usage.output_tokens"]).toBe(20);
     const runDuration = lastHistogramRecord("openclaw.run.duration_ms");
     expect(runDuration?.[0]).toBe(100);
     expect(Object.hasOwn(runDuration?.[1] ?? {}, "openclaw.runId")).toBe(false);
@@ -1449,6 +2855,7 @@ describe("diagnostics-otel service", () => {
     expect(Object.hasOwn(harnessDuration?.[1] ?? {}, "openclaw.sessionKey")).toBe(false);
     const toolDuration = lastHistogramRecord("openclaw.tool.execution.duration_ms");
     expect(toolDuration?.[0]).toBe(20);
+    expect(toolDuration?.[1]?.["openclaw.tool.source"]).toBe("core");
     expect(Object.hasOwn(toolDuration?.[1] ?? {}, "openclaw.errorCode")).toBe(false);
     expect(Object.hasOwn(toolDuration?.[1] ?? {}, "openclaw.runId")).toBe(false);
 
@@ -1494,6 +2901,75 @@ describe("diagnostics-otel service", () => {
     expect(Object.hasOwn(failoverOptions?.attributes ?? {}, "openclaw.sessionKey")).toBe(false);
     expect(failoverOptions?.startTime).toBeTypeOf("number");
     expect(firstSpanEndTime("openclaw.model.failover")).toBeTypeOf("number");
+    expect(firstCounterAddCall("openclaw.model.failover")).toStrictEqual([
+      1,
+      {
+        "openclaw.failover.reason": "overloaded",
+        "openclaw.failover.suspended": "true",
+        "openclaw.lane": "main",
+        "openclaw.model": "claude-opus-4-6",
+        "openclaw.provider": "anthropic",
+        "openclaw.failover.to_model": "gpt-5.4",
+        "openclaw.failover.to_provider": "openai",
+      },
+    ]);
+    await service.stop?.(ctx);
+  });
+
+  test("records blocked tool metrics even when traces are disabled", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { metrics: true, traces: false });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "tool.execution.blocked",
+      runId: "run-should-not-export",
+      toolName: "browser",
+      toolSource: "mcp",
+      toolOwner: "browser-tools",
+      deniedReason: "tools.deny",
+      reason: "matched browser",
+      paramsSummary: { kind: "object" },
+    });
+    await flushDiagnosticEvents();
+
+    expect(firstCounterAddCall("openclaw.tool.execution.blocked")).toStrictEqual([
+      1,
+      {
+        "openclaw.toolName": "browser",
+        "openclaw.tool.source": "mcp",
+        "gen_ai.tool.name": "browser",
+        "openclaw.tool.owner": "browser-tools",
+        "openclaw.tool.params.kind": "object",
+        "openclaw.deniedReason": "tools.deny",
+      },
+    ]);
+    expect(telemetryState.tracer.startSpan).not.toHaveBeenCalledWith(
+      "openclaw.tool.execution",
+      expect.anything(),
+      expect.anything(),
+    );
+
+    await service.stop?.(ctx);
+  });
+
+  test("drops session-shaped queue lanes from model failover spans", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true });
+    await service.start(ctx);
+
+    emitDiagnosticEvent({
+      type: "model.failover",
+      lane: "session:Agent:qa:otel-trace-smoke",
+      reason: "overloaded",
+      fromProvider: "anthropic",
+      fromModel: "claude-opus-4-6",
+    });
+    await flushDiagnosticEvents();
+
+    const failoverOptions = startedSpanOptions("openclaw.model.failover");
+    expect(failoverOptions?.attributes?.["openclaw.lane"]).toBe("session");
+    expect(JSON.stringify(failoverOptions?.attributes)).not.toContain("Agent:qa:otel-trace-smoke");
     await service.stop?.(ctx);
   });
 
@@ -1549,7 +3025,7 @@ describe("diagnostics-otel service", () => {
     await service.stop?.(ctx);
   });
 
-  test("uses latest GenAI provider attribute only when semconv opt-in is set", async () => {
+  test("uses latest GenAI inference span shape only when semconv opt-in is set", async () => {
     process.env.OTEL_SEMCONV_STABILITY_OPT_IN = "http,gen_ai_latest_experimental";
 
     const service = createDiagnosticsOtelService();
@@ -1574,12 +3050,14 @@ describe("diagnostics-otel service", () => {
     });
     await flushDiagnosticEvents();
 
-    const modelCallOptions = startedSpanOptions("openclaw.model.call");
+    expect(startedSpanOptions("openclaw.model.call")).toBeUndefined();
+    const modelCallOptions = startedSpanOptions("text_completion gpt-5.4");
     expect(modelCallOptions?.attributes?.["gen_ai.provider.name"]).toBe("openai");
     expect(modelCallOptions?.attributes?.["gen_ai.request.model"]).toBe("gpt-5.4");
     expect(modelCallOptions?.attributes?.["gen_ai.operation.name"]).toBe("text_completion");
     expect(Object.hasOwn(modelCallOptions?.attributes ?? {}, "gen_ai.system")).toBe(false);
     expect(modelCallOptions?.startTime).toBeTypeOf("number");
+    expect(modelCallOptions?.kind).toBe(2);
     const modelUsageOptions = startedSpanOptions("openclaw.model.usage");
     expect(modelUsageOptions?.attributes?.["gen_ai.provider.name"]).toBe("openai");
     expect(modelUsageOptions?.attributes?.["gen_ai.request.model"]).toBe("gpt-5.4");
@@ -1816,6 +3294,40 @@ describe("diagnostics-otel service", () => {
     await service.stop?.(ctx);
   });
 
+  test("records async diagnostic queue drop summaries", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { metrics: true });
+    await service.start(ctx);
+
+    emitDiagnosticEvent({
+      type: "diagnostic.async_queue.dropped",
+      droppedEvents: 4,
+      droppedTrustedEvents: 1,
+      droppedUntrustedEvents: 2,
+      droppedPriorityEvents: 1,
+      queueLength: 0,
+      maxQueueLength: 10_000,
+      drainBatchSize: 100,
+    });
+    await flushDiagnosticEvents();
+
+    const counter = telemetryState.counters.get("openclaw.diagnostic.async_queue.dropped");
+    expect(counter?.add).toHaveBeenCalledWith(4, {
+      "openclaw.diagnostic.async_queue.drop_class": "total",
+    });
+    expect(counter?.add).toHaveBeenCalledWith(1, {
+      "openclaw.diagnostic.async_queue.drop_class": "trusted",
+    });
+    expect(counter?.add).toHaveBeenCalledWith(2, {
+      "openclaw.diagnostic.async_queue.drop_class": "untrusted",
+    });
+    expect(counter?.add).toHaveBeenCalledWith(1, {
+      "openclaw.diagnostic.async_queue.drop_class": "priority",
+    });
+
+    await service.stop?.(ctx);
+  });
+
   test("parents trusted diagnostic lifecycle spans from active started spans", async () => {
     const service = createDiagnosticsOtelService();
     const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
@@ -1931,7 +3443,581 @@ describe("diagnostics-otel service", () => {
     await service.stop?.(ctx);
   });
 
-  test("keeps trusted run spans alive long enough for post-completion usage parenting", async () => {
+  test("correlates one channel message waterfall across message, harness, usage, and model spans", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "message.dispatch.started",
+      channel: "slack",
+      source: "replyResolver",
+      sessionKey: "agent:main:slack:channel:c1",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "harness.run.started",
+      runId: "run-1",
+      harnessId: "codex",
+      pluginId: "codex",
+      provider: "openai",
+      model: "gpt-5.5",
+      channel: "slack",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: GRANDCHILD_SPAN_ID,
+        parentSpanId: CHILD_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "run.started",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.5",
+      channel: "slack",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: TOOL_SPAN_ID,
+        parentSpanId: GRANDCHILD_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "model.call.started",
+      runId: "run-1",
+      callId: "call-1",
+      provider: "openai",
+      model: "gpt-5.5",
+      api: "openai-codex-responses",
+      transport: "stdio",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: MODEL_CALL_SPAN_ID,
+        parentSpanId: TOOL_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "model.call.completed",
+      runId: "run-1",
+      callId: "call-1",
+      provider: "openai",
+      model: "gpt-5.5",
+      api: "openai-codex-responses",
+      transport: "stdio",
+      durationMs: 80,
+      trace: {
+        traceId: TRACE_ID,
+        spanId: MODEL_CALL_SPAN_ID,
+        parentSpanId: TOOL_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "harness.run.completed",
+      runId: "run-1",
+      harnessId: "codex",
+      pluginId: "codex",
+      provider: "openai",
+      model: "gpt-5.5",
+      channel: "slack",
+      durationMs: 100,
+      outcome: "completed",
+      itemLifecycle: { startedCount: 1, completedCount: 1, activeCount: 0 },
+      trace: {
+        traceId: TRACE_ID,
+        spanId: GRANDCHILD_SPAN_ID,
+        parentSpanId: CHILD_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "model.usage",
+      sessionKey: "agent:main:slack:channel:c1",
+      channel: "slack",
+      agentId: "main",
+      provider: "openai",
+      model: "gpt-5.5",
+      usage: { input: 3, output: 2, total: 5 },
+      durationMs: 10,
+      trace: {
+        traceId: TRACE_ID,
+        spanId: MODEL_USAGE_SPAN_ID,
+        parentSpanId: GRANDCHILD_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "message.processed",
+      channel: "slack",
+      sessionKey: "agent:main:slack:channel:c1",
+      durationMs: 120,
+      outcome: "completed",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    await flushDiagnosticEvents();
+
+    const messageSpan = spanByName("openclaw.message.processed");
+    const harnessSpan = spanByName("openclaw.harness.run");
+    const runSpan = spanByName("openclaw.run");
+    const usageSpan = spanByName("openclaw.model.usage");
+    const modelCallSpan = spanByName("openclaw.model.call");
+    const messageSpanContext = messageSpan.spanContext();
+    const harnessSpanContext = harnessSpan.spanContext();
+    const runSpanContext = runSpan.spanContext();
+    const usageSpanContext = usageSpan.spanContext();
+    const modelCallSpanContext = modelCallSpan.spanContext();
+
+    const parentBySpanName = Object.fromEntries(
+      telemetryState.tracer.startSpan.mock.calls.map((call) => [
+        call[0],
+        (call[2] as { spanContext?: { traceId?: string; spanId?: string } } | undefined)
+          ?.spanContext,
+      ]),
+    );
+
+    expect(messageSpanContext.traceId).toBe(TRACE_ID);
+    expect(harnessSpanContext.traceId).toBe(TRACE_ID);
+    expect(usageSpanContext.traceId).toBe(TRACE_ID);
+    expect(modelCallSpanContext.traceId).toBe(TRACE_ID);
+    expect(parentBySpanName["openclaw.message.processed"]?.spanId).toBe(SPAN_ID);
+    expect(parentBySpanName["openclaw.harness.run"]?.spanId).toBe(messageSpanContext.spanId);
+    expect(parentBySpanName["openclaw.run"]?.spanId).toBe(harnessSpanContext.spanId);
+    expect(parentBySpanName["openclaw.model.usage"]?.spanId).toBe(harnessSpanContext.spanId);
+    expect(parentBySpanName["openclaw.model.call"]?.spanId).toBe(runSpanContext.spanId);
+    await service.stop?.(ctx);
+  });
+
+  test("uses production message lifecycle helpers as the message span anchor", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    const messageTrace = createDiagnosticTraceContext({
+      traceId: TRACE_ID,
+      spanId: CHILD_SPAN_ID,
+      parentSpanId: SPAN_ID,
+      traceFlags: "01",
+    });
+
+    runWithDiagnosticTraceContext(messageTrace, () => {
+      logMessageDispatchStarted({
+        channel: "slack",
+        sessionKey: "agent:main:slack:channel:c1",
+        source: "replyResolver",
+      });
+      emitTrustedDiagnosticEvent({
+        type: "harness.run.started",
+        runId: "run-1",
+        harnessId: "codex",
+        pluginId: "codex",
+        provider: "openai",
+        model: "gpt-5.5",
+        channel: "slack",
+        trace: {
+          traceId: TRACE_ID,
+          spanId: GRANDCHILD_SPAN_ID,
+          parentSpanId: CHILD_SPAN_ID,
+          traceFlags: "01",
+        },
+      });
+      emitTrustedDiagnosticEvent({
+        type: "model.usage",
+        sessionKey: "agent:main:slack:channel:c1",
+        channel: "slack",
+        agentId: "main",
+        provider: "openai",
+        model: "gpt-5.5",
+        usage: { input: 3, output: 2, total: 5 },
+        durationMs: 10,
+        trace: {
+          traceId: TRACE_ID,
+          spanId: MODEL_USAGE_SPAN_ID,
+          parentSpanId: GRANDCHILD_SPAN_ID,
+          traceFlags: "01",
+        },
+      });
+      logMessageProcessed({
+        channel: "slack",
+        sessionKey: "agent:main:slack:channel:c1",
+        durationMs: 120,
+        outcome: "completed",
+      });
+    });
+    await flushDiagnosticEvents();
+
+    const messageSpan = spanByName("openclaw.message.processed");
+    const harnessSpan = spanByName("openclaw.harness.run");
+    const messageSpanContext = messageSpan.spanContext();
+    const harnessSpanContext = harnessSpan.spanContext();
+    const parentBySpanName = Object.fromEntries(
+      telemetryState.tracer.startSpan.mock.calls.map((call) => [
+        call[0],
+        (call[2] as { spanContext?: { traceId?: string; spanId?: string } } | undefined)
+          ?.spanContext,
+      ]),
+    );
+
+    expect(parentBySpanName["openclaw.message.processed"]?.spanId).toBe(SPAN_ID);
+    expect(parentBySpanName["openclaw.harness.run"]?.spanId).toBe(messageSpanContext.spanId);
+    expect(parentBySpanName["openclaw.model.usage"]?.spanId).toBe(harnessSpanContext.spanId);
+    expect(messageSpanContext.traceId).toBe(TRACE_ID);
+    expect(harnessSpanContext.traceId).toBe(TRACE_ID);
+    await service.stop?.(ctx);
+  });
+
+  test("does not force a remote parent for root message lifecycle helpers", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    const messageTrace = createDiagnosticTraceContext({
+      traceId: TRACE_ID,
+      spanId: CHILD_SPAN_ID,
+      traceFlags: "01",
+    });
+
+    runWithDiagnosticTraceContext(messageTrace, () => {
+      logMessageDispatchStarted({
+        channel: "slack",
+        sessionKey: "agent:main:slack:channel:c1",
+        source: "replyResolver",
+      });
+      logMessageProcessed({
+        channel: "slack",
+        sessionKey: "agent:main:slack:channel:c1",
+        durationMs: 120,
+        outcome: "completed",
+      });
+    });
+    await flushDiagnosticEvents();
+
+    expect(spanByName("openclaw.message.processed").spanContext().traceId).toBe(TRACE_ID);
+    expect(startedSpanParentContexts("openclaw.message.processed")[0]).toBeUndefined();
+    await service.stop?.(ctx);
+  });
+
+  test("parents outbound delivery spans under the active message lifecycle span", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    const messageTrace = createDiagnosticTraceContext({
+      traceId: TRACE_ID,
+      spanId: CHILD_SPAN_ID,
+      parentSpanId: SPAN_ID,
+      traceFlags: "01",
+    });
+
+    runWithDiagnosticTraceContext(messageTrace, () => {
+      logMessageDispatchStarted({
+        channel: "slack",
+        sessionKey: "agent:main:slack:channel:c1",
+        source: "replyResolver",
+      });
+      emitInternalDiagnosticEventForTest({
+        type: "message.delivery.completed",
+        channel: "slack",
+        deliveryKind: "text",
+        sessionKey: "agent:main:slack:channel:c1",
+        durationMs: 15,
+        resultCount: 1,
+      });
+      emitInternalDiagnosticEventForTest({
+        type: "message.delivery.error",
+        channel: "slack",
+        deliveryKind: "media",
+        sessionKey: "agent:main:slack:channel:c1",
+        durationMs: 25,
+        errorCategory: "network",
+      });
+      logMessageProcessed({
+        channel: "slack",
+        sessionKey: "agent:main:slack:channel:c1",
+        durationMs: 120,
+        outcome: "completed",
+      });
+    });
+    await flushDiagnosticEvents();
+
+    const messageSpanContext = spanByName("openclaw.message.processed").spanContext();
+    const deliveryParentContexts = startedSpanParentContexts("openclaw.message.delivery");
+
+    expect(deliveryParentContexts).toHaveLength(2);
+    expect(deliveryParentContexts[0]?.traceId).toBe(TRACE_ID);
+    expect(deliveryParentContexts[0]?.spanId).toBe(messageSpanContext.spanId);
+    expect(deliveryParentContexts[1]?.traceId).toBe(TRACE_ID);
+    expect(deliveryParentContexts[1]?.spanId).toBe(messageSpanContext.spanId);
+    await service.stop?.(ctx);
+  });
+
+  test("parents multi-batch late delivery spans from the retained message context", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    const messageTrace = createDiagnosticTraceContext({
+      traceId: TRACE_ID,
+      spanId: CHILD_SPAN_ID,
+      parentSpanId: SPAN_ID,
+      traceFlags: "01",
+    });
+
+    runWithDiagnosticTraceContext(messageTrace, () => {
+      logMessageDispatchStarted({
+        channel: "slack",
+        sessionKey: "agent:main:slack:channel:c1",
+        source: "replyResolver",
+      });
+      for (let index = 0; index < 125; index += 1) {
+        emitInternalDiagnosticEventForTest({
+          type: "message.delivery.completed",
+          channel: "slack",
+          deliveryKind: "text",
+          sessionKey: `agent:main:slack:channel:c${index}`,
+          durationMs: 15,
+          resultCount: 1,
+        });
+      }
+      logMessageProcessed({
+        channel: "slack",
+        sessionKey: "agent:main:slack:channel:c1",
+        durationMs: 120,
+        outcome: "completed",
+      });
+    });
+
+    const messageSpan = spanByName("openclaw.message.processed");
+    const messageSpanContext = messageSpan.spanContext();
+    expect(messageSpan.end).toHaveBeenCalledTimes(1);
+    await waitForDiagnosticEventsDrained();
+
+    const deliveryParentContexts = startedSpanParentContexts("openclaw.message.delivery");
+    expect(deliveryParentContexts).toHaveLength(125);
+    expect(deliveryParentContexts.every((parent) => parent?.traceId === TRACE_ID)).toBe(true);
+    expect(
+      deliveryParentContexts.every((parent) => parent?.spanId === messageSpanContext.spanId),
+    ).toBe(true);
+    await service.stop?.(ctx);
+  });
+
+  test("correlates skipped duplicate message lifecycle helpers to the active inbound trace", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    const messageTrace = createDiagnosticTraceContext({
+      traceId: TRACE_ID,
+      spanId: CHILD_SPAN_ID,
+      parentSpanId: SPAN_ID,
+      traceFlags: "01",
+    });
+
+    runWithDiagnosticTraceContext(messageTrace, () => {
+      logMessageProcessed({
+        channel: "slack",
+        messageId: "msg-duplicate",
+        chatId: "c1",
+        sessionKey: "agent:main:slack:channel:c1",
+        durationMs: 5,
+        outcome: "skipped",
+        reason: "duplicate",
+      });
+    });
+    await flushDiagnosticEvents();
+
+    const messageSpan = spanByName("openclaw.message.processed");
+    const messageSpanContext = messageSpan.spanContext();
+    const parentContext = startedSpanParentContexts("openclaw.message.processed")[0];
+
+    expect(messageSpanContext.traceId).toBe(TRACE_ID);
+    expect(parentContext?.traceId).toBe(TRACE_ID);
+    expect(parentContext?.spanId).toBe(SPAN_ID);
+    expect(firstSpanAttributes("openclaw.message.processed")["openclaw.reason"]).toBe("duplicate");
+    expect(messageSpan.end).toHaveBeenCalledTimes(1);
+    await service.stop?.(ctx);
+  });
+
+  test("does not force a remote parent for fallback root message processed spans", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "message.processed",
+      channel: "slack",
+      sessionKey: "agent:main:slack:channel:c1",
+      durationMs: 25,
+      outcome: "skipped",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    await flushDiagnosticEvents();
+
+    expect(spanByName("openclaw.message.processed").spanContext().traceId).toBe(TRACE_ID);
+    expect(startedSpanParentContexts("openclaw.message.processed")[0]).toBeUndefined();
+    await service.stop?.(ctx);
+  });
+
+  test("does not retain fallback message processed spans as active parents", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "message.processed",
+      channel: "slack",
+      sessionKey: "agent:main:slack:channel:c1",
+      durationMs: 25,
+      outcome: "skipped",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    expect(spanByName("openclaw.message.processed").end).toHaveBeenCalledTimes(1);
+
+    telemetryState.tracer.setSpanContext.mockClear();
+    emitTrustedDiagnosticEvent({
+      type: "harness.run.started",
+      runId: "run-1",
+      harnessId: "codex",
+      pluginId: "codex",
+      provider: "openai",
+      model: "gpt-5.5",
+      channel: "slack",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: GRANDCHILD_SPAN_ID,
+        parentSpanId: CHILD_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+
+    expect(telemetryState.tracer.setSpanContext).not.toHaveBeenCalled();
+    expect(startedSpanCall("openclaw.harness.run")?.[2]).toBeUndefined();
+    await service.stop?.(ctx);
+  });
+
+  test("retains trusted run context long enough for exact post-completion usage parenting", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "run.started",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "run.completed",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      outcome: "completed",
+      durationMs: 100,
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    await Promise.resolve();
+    emitTrustedDiagnosticEvent({
+      type: "model.usage",
+      provider: "openai",
+      model: "gpt-5.4",
+      usage: { input: 3, output: 2, total: 5 },
+      durationMs: 10,
+      trace: {
+        traceId: TRACE_ID,
+        spanId: GRANDCHILD_SPAN_ID,
+        parentSpanId: CHILD_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    await flushDiagnosticEvents();
+
+    const runSpan = telemetryState.spans.find((span) => span.name === "openclaw.run");
+    const runSpanId = runSpan?.spanContext.mock.results[0]?.value?.spanId;
+    const modelUsageCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.model.usage",
+    );
+
+    const linkedSpanContext = firstSetSpanContext();
+    expect(linkedSpanContext.traceId).toBe(TRACE_ID);
+    expect(linkedSpanContext.spanId).toBe(runSpanId);
+    expect(
+      (modelUsageCall?.[2] as { spanContext?: { spanId?: string } } | undefined)?.spanContext
+        ?.spanId,
+    ).toBe(runSpanId);
+    expect(firstSpanEndTime("openclaw.run")).toBeTypeOf("number");
+    await service.stop?.(ctx);
+  });
+
+  test("does not parent sibling active runs through shared upstream aliases", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "run.started",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "run.started",
+      runId: "run-2",
+      provider: "openai",
+      model: "gpt-5.4",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: GRANDCHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+
+    const runContexts = startedSpanParentContextsByName("openclaw.run");
+
+    expect(runContexts).toHaveLength(2);
+    expect(runContexts[0]?.parentContext).toBeUndefined();
+    expect(runContexts[1]?.parentContext).toBeUndefined();
+    await service.stop?.(ctx);
+  });
+
+  test("does not parent sibling runs through retained upstream aliases", async () => {
     const service = createDiagnosticsOtelService();
     const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
     await service.start(ctx);
@@ -1963,6 +4049,201 @@ describe("diagnostics-otel service", () => {
       },
     });
     emitTrustedDiagnosticEvent({
+      type: "run.started",
+      runId: "run-2",
+      provider: "openai",
+      model: "gpt-5.4",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: GRANDCHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+
+    const runContexts = startedSpanParentContextsByName("openclaw.run");
+
+    expect(runContexts).toHaveLength(2);
+    expect(runContexts[0]?.parentContext).toBeUndefined();
+    expect(runContexts[1]?.parentContext).toBeUndefined();
+    await service.stop?.(ctx);
+  });
+
+  test("parents retained upstream alias events only when the owner matches", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "run.started",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "model.call.completed",
+      runId: "run-1",
+      callId: "call-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      durationMs: 80,
+      trace: {
+        traceId: TRACE_ID,
+        spanId: MODEL_CALL_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    emitTrustedDiagnosticEvent({
+      type: "run.completed",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      outcome: "completed",
+      durationMs: 100,
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    await flushDiagnosticEvents();
+
+    const runSpanContext = spanByName("openclaw.run").spanContext();
+    const modelParentContext = startedSpanParentContexts("openclaw.model.call")[0];
+
+    expect(modelParentContext?.traceId).toBe(TRACE_ID);
+    expect(modelParentContext?.spanId).toBe(runSpanContext.spanId);
+    await service.stop?.(ctx);
+  });
+
+  test("parents multi-batch late model spans from the retained run context", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "run.started",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    for (let index = 0; index < 125; index += 1) {
+      emitTrustedDiagnosticEvent({
+        type: "model.call.completed",
+        runId: "run-1",
+        callId: `call-${index}`,
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+        trace: {
+          traceId: TRACE_ID,
+          spanId: numberedSpanId(index),
+          parentSpanId: CHILD_SPAN_ID,
+          traceFlags: "01",
+        },
+      });
+    }
+    emitTrustedDiagnosticEvent({
+      type: "run.completed",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      outcome: "completed",
+      durationMs: 100,
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+
+    const runSpan = spanByName("openclaw.run");
+    const runSpanContext = runSpan.spanContext();
+    expect(runSpan.end).toHaveBeenCalledTimes(1);
+    await waitForDiagnosticEventsDrained();
+
+    const modelParentContexts = startedSpanParentContexts("openclaw.model.call");
+    expect(modelParentContexts).toHaveLength(125);
+    expect(modelParentContexts.every((parent) => parent?.traceId === TRACE_ID)).toBe(true);
+    expect(modelParentContexts.every((parent) => parent?.spanId === runSpanContext.spanId)).toBe(
+      true,
+    );
+    await service.stop?.(ctx);
+  });
+
+  test("removes retained run contexts after queued diagnostics drain", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "run.started",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+    for (let index = 0; index < 125; index += 1) {
+      emitTrustedDiagnosticEvent({
+        type: "model.call.completed",
+        runId: "run-1",
+        callId: `call-${index}`,
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+        trace: {
+          traceId: TRACE_ID,
+          spanId: numberedSpanId(index),
+          parentSpanId: CHILD_SPAN_ID,
+          traceFlags: "01",
+        },
+      });
+    }
+    emitTrustedDiagnosticEvent({
+      type: "run.completed",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      outcome: "completed",
+      durationMs: 100,
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+
+    await waitForDiagnosticEventsDrained();
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    await waitForDiagnosticEventsDrained();
+    await Promise.resolve();
+    telemetryState.tracer.setSpanContext.mockClear();
+    telemetryState.tracer.startSpan.mockClear();
+
+    emitTrustedDiagnosticEvent({
       type: "model.usage",
       provider: "openai",
       model: "gpt-5.4",
@@ -1971,26 +4252,69 @@ describe("diagnostics-otel service", () => {
       trace: {
         traceId: TRACE_ID,
         spanId: GRANDCHILD_SPAN_ID,
+        parentSpanId: CHILD_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+
+    expect(telemetryState.tracer.setSpanContext).not.toHaveBeenCalled();
+    expect(startedSpanCall("openclaw.model.usage")?.[2]).toBeUndefined();
+    await service.stop?.(ctx);
+  });
+
+  test("clears retained run contexts when the service stops", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitTrustedDiagnosticEvent({
+      type: "run.started",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
         parentSpanId: SPAN_ID,
         traceFlags: "01",
       },
     });
-    await flushDiagnosticEvents();
+    emitTrustedDiagnosticEvent({
+      type: "run.completed",
+      runId: "run-1",
+      provider: "openai",
+      model: "gpt-5.4",
+      outcome: "completed",
+      durationMs: 100,
+      trace: {
+        traceId: TRACE_ID,
+        spanId: CHILD_SPAN_ID,
+        parentSpanId: SPAN_ID,
+        traceFlags: "01",
+      },
+    });
 
-    const runSpan = telemetryState.spans.find((span) => span.name === "openclaw.run");
-    const runSpanId = runSpan?.spanContext.mock.results[0]?.value?.spanId;
-    const modelUsageCall = telemetryState.tracer.startSpan.mock.calls.find(
-      (call) => call[0] === "openclaw.model.usage",
-    );
+    await service.stop?.(ctx);
+    await service.start(ctx);
+    telemetryState.tracer.setSpanContext.mockClear();
+    telemetryState.tracer.startSpan.mockClear();
 
-    const linkedSpanContext = firstSetSpanContext();
-    expect(linkedSpanContext.traceId).toBe(TRACE_ID);
-    expect(linkedSpanContext.spanId).toBe(runSpanId);
-    expect(
-      (modelUsageCall?.[2] as { spanContext?: { spanId?: string } } | undefined)?.spanContext
-        ?.spanId,
-    ).toBe(runSpanId);
-    expect(firstSpanEndTime("openclaw.run")).toBeTypeOf("number");
+    emitTrustedDiagnosticEvent({
+      type: "model.usage",
+      provider: "openai",
+      model: "gpt-5.4",
+      usage: { input: 3, output: 2, total: 5 },
+      durationMs: 10,
+      trace: {
+        traceId: TRACE_ID,
+        spanId: GRANDCHILD_SPAN_ID,
+        parentSpanId: CHILD_SPAN_ID,
+        traceFlags: "01",
+      },
+    });
+
+    expect(telemetryState.tracer.setSpanContext).not.toHaveBeenCalled();
+    expect(startedSpanCall("openclaw.model.usage")?.[2]).toBeUndefined();
     await service.stop?.(ctx);
   });
 
@@ -2492,26 +4816,32 @@ describe("diagnostics-otel service", () => {
     const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
     await service.start(ctx);
 
-    emitDiagnosticEvent({
-      type: "model.call.completed",
-      runId: "run-1",
-      callId: "call-1",
-      provider: "openai",
-      model: "gpt-5.4",
-      durationMs: 80,
-      inputMessages: ["private user prompt"],
-      outputMessages: ["private model reply"],
-      systemPrompt: "private system prompt",
-    } as Parameters<typeof emitDiagnosticEvent>[0]);
-    emitDiagnosticEvent({
-      type: "tool.execution.completed",
-      runId: "run-1",
-      toolName: "read",
-      toolCallId: "tool-1",
-      durationMs: 20,
-      toolInput: "private tool input",
-      toolOutput: "private tool output",
-    } as Parameters<typeof emitDiagnosticEvent>[0]);
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      {
+        inputMessages: ["private user prompt"],
+        outputMessages: ["private model reply"],
+        systemPrompt: "private system prompt",
+      },
+    );
+    emitTrustedToolExecutionCompletedWithContent(
+      {
+        runId: "run-1",
+        toolName: "read",
+        toolCallId: "tool-1",
+        durationMs: 20,
+      },
+      {
+        toolInput: "private tool input",
+        toolOutput: "private tool output",
+      },
+    );
     await flushDiagnosticEvents();
 
     const modelOptions = startedSpanOptions("openclaw.model.call");
@@ -2530,6 +4860,10 @@ describe("diagnostics-otel service", () => {
     expect(Object.hasOwn(toolOptions?.attributes ?? {}, "openclaw.content.tool_output")).toBe(
       false,
     );
+    expect(Object.hasOwn(toolOptions?.attributes ?? {}, "gen_ai.tool.call.arguments")).toBe(false);
+    expect(Object.hasOwn(toolOptions?.attributes ?? {}, "gen_ai.tool.call.result")).toBe(false);
+    expect(toolOptions?.attributes?.["gen_ai.tool.call.id"]).toBe("tool-1");
+    expect(toolOptions?.attributes?.["gen_ai.operation.name"]).toBe("execute_tool");
     expect(toolOptions?.startTime).toBeTypeOf("number");
     await service.stop?.(ctx);
   });
@@ -2550,26 +4884,32 @@ describe("diagnostics-otel service", () => {
     });
     await service.start(ctx);
 
-    emitDiagnosticEvent({
-      type: "model.call.completed",
-      runId: "run-1",
-      callId: "call-1",
-      provider: "openai",
-      model: "gpt-5.4",
-      durationMs: 80,
-      inputMessages: ["use key sk-1234567890abcdef1234567890abcdef"], // pragma: allowlist secret
-      outputMessages: ["model reply"],
-      systemPrompt: "system prompt",
-    } as Parameters<typeof emitDiagnosticEvent>[0]);
-    emitDiagnosticEvent({
-      type: "tool.execution.completed",
-      runId: "run-1",
-      toolName: "read",
-      toolCallId: "tool-1",
-      durationMs: 20,
-      toolInput: "tool input",
-      toolOutput: `${"x".repeat(4077)} Bearer ${"a".repeat(80)}`, // pragma: allowlist secret
-    } as Parameters<typeof emitDiagnosticEvent>[0]);
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      {
+        inputMessages: ["use key sk-1234567890abcdef1234567890abcdef"], // pragma: allowlist secret
+        outputMessages: ["model reply"],
+        systemPrompt: "system prompt",
+      },
+    );
+    emitTrustedToolExecutionCompletedWithContent(
+      {
+        runId: "run-1",
+        toolName: "read",
+        toolCallId: "tool-1",
+        durationMs: 20,
+      },
+      {
+        toolInput: "tool input",
+        toolOutput: `${"x".repeat(4077)} Bearer ${"a".repeat(80)}`, // pragma: allowlist secret
+      },
+    );
     await flushDiagnosticEvents();
 
     const modelCall = telemetryState.tracer.startSpan.mock.calls.find(
@@ -2589,10 +4929,520 @@ describe("diagnostics-otel service", () => {
       "sk-1234567890abcdef1234567890abcdef", // pragma: allowlist secret
     );
     expect(toolAttrs?.["openclaw.content.tool_input"]).toBe("tool input");
+    expect(toolAttrs?.["gen_ai.tool.call.id"]).toBe("tool-1");
+    expect(toolAttrs?.["gen_ai.operation.name"]).toBe("execute_tool");
+    expect(toolAttrs?.["gen_ai.tool.call.arguments"]).toBe(
+      toolAttrs?.["openclaw.content.tool_input"],
+    );
+    expect(typeof toolAttrs?.["openclaw.content.tool_output"]).toBe("string");
     expect(String(toolAttrs?.["openclaw.content.tool_output"]).length).toBeLessThanOrEqual(
       MAX_TEST_OTEL_CONTENT_ATTRIBUTE_CHARS + OTEL_TRUNCATED_SUFFIX_MAX_CHARS,
     );
     expect(String(toolAttrs?.["openclaw.content.tool_output"])).not.toContain("a".repeat(11));
+    expect(toolAttrs?.["gen_ai.tool.call.result"]).toBe(
+      toolAttrs?.["openclaw.content.tool_output"],
+    );
+    await service.stop?.(ctx);
+  });
+
+  test("omits absent model content fields when capture fields are opted in", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      traces: true,
+      captureContent: {
+        enabled: true,
+        inputMessages: true,
+        outputMessages: true,
+        systemPrompt: true,
+        toolDefinitions: true,
+      },
+    });
+    await service.start(ctx);
+
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      { inputMessages: ["user prompt"] },
+    );
+    await flushDiagnosticEvents();
+
+    const modelCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.model.call",
+    );
+    const attrs =
+      (modelCall?.[1] as { attributes?: Record<string, unknown> } | undefined)?.attributes ?? {};
+    expect(attrs["openclaw.content.input_messages"]).toBe("user prompt");
+    expect(Object.hasOwn(attrs, "openclaw.content.output_messages")).toBe(false);
+    expect(Object.hasOwn(attrs, "openclaw.content.system_prompt")).toBe(false);
+    expect(Object.hasOwn(attrs, "openclaw.content.tool_definitions")).toBe(false);
+    expect(Object.hasOwn(attrs, "gen_ai.output.messages")).toBe(false);
+    expect(Object.hasOwn(attrs, "gen_ai.system_instructions")).toBe(false);
+    expect(Object.hasOwn(attrs, "gen_ai.tool.definitions")).toBe(false);
+    await service.stop?.(ctx);
+  });
+
+  test("exports Phoenix-readable GenAI prompt, output, and tool definition attributes", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      traces: true,
+      captureContent: {
+        enabled: true,
+        inputMessages: true,
+        outputMessages: true,
+        systemPrompt: true,
+        toolDefinitions: true,
+      },
+    });
+    await service.start(ctx);
+
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      {
+        inputMessages: [
+          { role: "user", content: "what changed?", timestamp: 1 },
+          {
+            role: "assistant",
+            content: [
+              { type: "toolCall", id: "call-1", name: "lookup", arguments: { q: "trace" } },
+            ],
+          },
+          { role: "toolResult", toolCallId: "call-1", content: { rows: 1 } },
+        ],
+        outputMessages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "the trace changed" }],
+            stopReason: "stop",
+          },
+        ],
+        systemPrompt: "be exact",
+        toolDefinitions: [
+          { name: "lookup", description: "Lookup data", parameters: { type: "object" } },
+        ],
+      },
+    );
+    await flushDiagnosticEvents();
+
+    const modelCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.model.call",
+    );
+    const attrs = (modelCall?.[1] as { attributes?: Record<string, unknown> } | undefined)
+      ?.attributes;
+    expect(attrs?.["gen_ai.system_instructions"]).toBe(
+      JSON.stringify([{ type: "text", content: "be exact" }]),
+    );
+    expect(JSON.parse(stringAttribute(attrs, "gen_ai.input.messages"))).toEqual([
+      { role: "user", parts: [{ type: "text", content: "what changed?" }] },
+      {
+        role: "assistant",
+        parts: [
+          {
+            type: "tool_call",
+            id: "call-1",
+            name: "lookup",
+            arguments: { q: "trace" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        parts: [{ type: "tool_call_response", id: "call-1", response: { rows: 1 } }],
+      },
+    ]);
+    expect(JSON.parse(stringAttribute(attrs, "gen_ai.output.messages"))).toEqual([
+      {
+        role: "assistant",
+        parts: [{ type: "text", content: "the trace changed" }],
+        finish_reason: "stop",
+      },
+    ]);
+    expect(JSON.parse(stringAttribute(attrs, "gen_ai.tool.definitions"))).toEqual([
+      {
+        type: "function",
+        name: "lookup",
+        description: "Lookup data",
+        parameters: { type: "object" },
+      },
+    ]);
+    expect(attrs?.["input.mime_type"]).toBe("application/json");
+    expect(attrs?.["output.mime_type"]).toBe("application/json");
+    await service.stop?.(ctx);
+  });
+
+  test("emits semconv response text for tool response parts", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      traces: true,
+      captureContent: {
+        enabled: true,
+        inputMessages: true,
+        outputMessages: false,
+      },
+    });
+    await service.start(ctx);
+
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      {
+        inputMessages: [
+          {
+            role: "tool",
+            parts: [
+              {
+                type: "tool_call_response",
+                id: "call-1",
+                result: [
+                  { type: "text", text: "first line" },
+                  { type: "text", text: "second line" },
+                ],
+              },
+            ],
+          },
+          {
+            role: "toolResult",
+            toolCallId: "call-2",
+            content: [
+              { type: "text", text: "alpha" },
+              { type: "text", text: "beta" },
+            ],
+          },
+        ],
+      },
+    );
+    await flushDiagnosticEvents();
+
+    const modelCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.model.call",
+    );
+    const attrs = (modelCall?.[1] as { attributes?: Record<string, unknown> } | undefined)
+      ?.attributes;
+    expect(JSON.parse(stringAttribute(attrs, "gen_ai.input.messages"))).toEqual([
+      {
+        role: "tool",
+        parts: [
+          {
+            type: "tool_call_response",
+            id: "call-1",
+            response: "first line\nsecond line",
+          },
+        ],
+      },
+      {
+        role: "tool",
+        parts: [
+          {
+            type: "tool_call_response",
+            id: "call-2",
+            response: "alpha\nbeta",
+          },
+        ],
+      },
+    ]);
+    await service.stop?.(ctx);
+  });
+
+  test("flattens oversized pure-text tool results with a truncation marker", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      traces: true,
+      captureContent: {
+        enabled: true,
+        inputMessages: true,
+        outputMessages: false,
+      },
+    });
+    await service.start(ctx);
+
+    const textParts = Array.from({ length: 201 }, (_, index) => ({
+      type: "text",
+      text: `line-${index}`,
+    }));
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      {
+        inputMessages: [{ role: "toolResult", toolCallId: "call-1", content: textParts }],
+      },
+    );
+    await flushDiagnosticEvents();
+
+    const modelCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.model.call",
+    );
+    const attrs = (modelCall?.[1] as { attributes?: Record<string, unknown> } | undefined)
+      ?.attributes;
+    const messages = JSON.parse(stringAttribute(attrs, "gen_ai.input.messages")) as {
+      parts: { response?: unknown }[];
+    }[];
+    const expected = `${textParts
+      .slice(0, 200)
+      .map((part) => part.text)
+      .join("\n")}\n...(1 more text parts omitted)`;
+    expect(messages[0]?.parts[0]?.response).toBe(expected);
+    await service.stop?.(ctx);
+  });
+
+  test("normalizes snake_case tool_call parts the same as camelCase toolCall parts", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      traces: true,
+      captureContent: {
+        enabled: true,
+        inputMessages: true,
+        outputMessages: false,
+      },
+    });
+    await service.start(ctx);
+
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      {
+        inputMessages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_call",
+                id: "tc-1",
+                name: "search",
+                arguments: { q: "x" },
+                extraField: "leaked",
+              },
+            ],
+          },
+        ],
+      },
+    );
+    await flushDiagnosticEvents();
+
+    const modelCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.model.call",
+    );
+    const attrs = (modelCall?.[1] as { attributes?: Record<string, unknown> } | undefined)
+      ?.attributes;
+    const parsed = JSON.parse(stringAttribute(attrs, "gen_ai.input.messages"));
+    expect(parsed[0].parts[0]).toEqual({
+      type: "tool_call",
+      id: "tc-1",
+      name: "search",
+      arguments: { q: "x" },
+    });
+    expect(JSON.stringify(parsed)).not.toContain("leaked");
+    await service.stop?.(ctx);
+  });
+
+  test("truncates oversized GenAI input messages instead of silently dropping them", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      traces: true,
+      captureContent: {
+        enabled: true,
+        inputMessages: true,
+        outputMessages: false,
+      },
+    });
+    await service.start(ctx);
+
+    // Build messages that exceed MAX_OTEL_CONTENT_ATTRIBUTE_CHARS (128KB) in total.
+    const largeMessages = Array.from({ length: 200 }, (_, i) => ({
+      role: "user",
+      content: `message-${i}-${"x".repeat(1024)}`,
+    }));
+
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      { inputMessages: largeMessages },
+    );
+    await flushDiagnosticEvents();
+
+    const modelCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.model.call",
+    );
+    const attrs = (modelCall?.[1] as { attributes?: Record<string, unknown> } | undefined)
+      ?.attributes;
+    const genAiInput = stringAttribute(attrs, "gen_ai.input.messages");
+    // Must not be empty — a truncated subset should appear.
+    expect(genAiInput.length).toBeGreaterThan(0);
+    // Must fit within the attribute size limit.
+    expect(genAiInput.length).toBeLessThanOrEqual(MAX_TEST_OTEL_CONTENT_ATTRIBUTE_CHARS + 50);
+    // The first message should still be present.
+    expect(genAiInput).toContain("message-0-");
+    expect(JSON.parse(genAiInput)[0]).toMatchObject({
+      role: "user",
+      parts: [{ type: "text" }],
+    });
+    await service.stop?.(ctx);
+  });
+
+  test("keeps single oversized GenAI messages and tool definitions parseable", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      traces: true,
+      captureContent: {
+        enabled: true,
+        inputMessages: true,
+        outputMessages: false,
+        toolDefinitions: true,
+      },
+    });
+    await service.start(ctx);
+
+    // The 8,192-character candidate budget leaves an 8,178-character text prefix;
+    // place a surrogate pair across that boundary so serialized JSON must stay valid.
+    const surrogateBoundaryPrefix = "x".repeat(8177);
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      {
+        inputMessages: [
+          {
+            role: "user",
+            content: `${surrogateBoundaryPrefix}🚀${"y".repeat(
+              MAX_TEST_OTEL_CONTENT_ATTRIBUTE_CHARS,
+            )}`,
+          },
+        ],
+        toolDefinitions: [
+          {
+            name: "huge_schema",
+            description: "Huge schema",
+            parameters: {
+              type: "object",
+              properties: {
+                payload: {
+                  type: "string",
+                  description: "x".repeat(MAX_TEST_OTEL_CONTENT_ATTRIBUTE_CHARS),
+                },
+              },
+            },
+          },
+        ],
+      },
+    );
+    await flushDiagnosticEvents();
+
+    const modelCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.model.call",
+    );
+    const attrs = (modelCall?.[1] as { attributes?: Record<string, unknown> } | undefined)
+      ?.attributes;
+    const genAiInput = stringAttribute(attrs, "gen_ai.input.messages");
+    const toolDefinitions = stringAttribute(attrs, "gen_ai.tool.definitions");
+    expect(genAiInput.length).toBeLessThanOrEqual(MAX_TEST_OTEL_CONTENT_ATTRIBUTE_CHARS);
+    expect(toolDefinitions.length).toBeLessThanOrEqual(MAX_TEST_OTEL_CONTENT_ATTRIBUTE_CHARS);
+    expect(genAiInput).not.toContain("\\ud83d");
+    expect(JSON.parse(genAiInput)).toEqual([
+      {
+        role: "user",
+        parts: [
+          {
+            type: "text",
+            content: `${surrogateBoundaryPrefix}...(truncated)`,
+          },
+        ],
+      },
+    ]);
+    expect(JSON.parse(toolDefinitions)[0]).toMatchObject({
+      type: "function",
+      name: "huge_schema",
+      parameters: {
+        type: "object",
+      },
+    });
+    await service.stop?.(ctx);
+  });
+
+  test("exports tool definitions without requiring input message capture", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, {
+      traces: true,
+      captureContent: {
+        enabled: true,
+        inputMessages: false,
+        toolDefinitions: true,
+      },
+    });
+    await service.start(ctx);
+
+    emitTrustedModelCallCompletedWithContent(
+      {
+        runId: "run-1",
+        callId: "call-1",
+        provider: "openai",
+        model: "gpt-5.4",
+        durationMs: 80,
+      },
+      {
+        inputMessages: [{ role: "user", content: "do not export this prompt" }],
+        toolDefinitions: [
+          { name: "lookup", description: "Lookup data", parameters: { type: "object" } },
+        ],
+      },
+    );
+    await flushDiagnosticEvents();
+
+    const modelCall = telemetryState.tracer.startSpan.mock.calls.find(
+      (call) => call[0] === "openclaw.model.call",
+    );
+    const attrs = (modelCall?.[1] as { attributes?: Record<string, unknown> } | undefined)
+      ?.attributes;
+    expect(Object.hasOwn(attrs ?? {}, "gen_ai.input.messages")).toBe(false);
+    expect(Object.hasOwn(attrs ?? {}, "input.value")).toBe(false);
+    expect(Object.hasOwn(attrs ?? {}, "openclaw.content.input_messages")).toBe(false);
+    expect(JSON.parse(stringAttribute(attrs, "gen_ai.tool.definitions"))).toEqual([
+      {
+        type: "function",
+        name: "lookup",
+        description: "Lookup data",
+        parameters: { type: "object" },
+      },
+    ]);
+    expect(JSON.parse(String(attrs?.["openclaw.content.tool_definitions"]))).toEqual([
+      {
+        name: "lookup",
+        description: "Lookup data",
+        parameters: { type: "object" },
+      },
+    ]);
     await service.stop?.(ctx);
   });
 
@@ -2644,3 +5494,4 @@ describe("diagnostics-otel service", () => {
     await service.stop?.(ctx);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -1,9 +1,10 @@
+// Non-interactive gateway health auth tests cover SecretRef and password resolution for setup probes.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { resolveGatewayHealthProbeToken } from "./onboard-non-interactive/local.js";
+import { resolveGatewayHealthProbeToken } from "./onboard-non-interactive/local.test-support.js";
 
 async function withTempDir<T>(run: (dir: string) => Promise<T>): Promise<T> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-gateway-health-auth-"));
